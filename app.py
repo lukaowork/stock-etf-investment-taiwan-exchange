@@ -449,21 +449,81 @@ def _match_row(df: pd.DataFrame, candidates):
     return None
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def fetch_us_lead_indicators() -> dict:
-    """yfinance 抓取 NVDA / AAPL 最新財報，計算 CapEx 年增率與庫存天數(DOI)趨勢。
+# 產業類別 → 對應追蹤的上游美股龍頭（Industry Mapping）
+INDUSTRY_LEADS: dict = {
+    "AI/伺服器": {
+        "leads": ["NVDA", "MSFT"],
+        "symbols": ["2317", "2382", "3231", "6669", "2368", "3324"],
+        "keywords": ["鴻海", "廣達", "緯創", "緯穎", "金像電", "雙鴻", "AI", "伺服器"],
+    },
+    "半導體/設備": {
+        "leads": ["ASML", "AMAT"],
+        "symbols": ["2330", "2303", "3680", "3131", "6187", "1540"],
+        "keywords": ["台積電", "聯電", "家登", "弘塑", "萬潤", "半導體", "設備"],
+    },
+    "網通/光通訊": {
+        "leads": ["ANET", "CSCO"],
+        "symbols": ["2345", "5388", "3596"],
+        "keywords": ["智邦", "中磊", "智易", "網通", "光通訊"],
+    },
+    "車用/電力": {
+        "leads": ["TSLA", "ON"],
+        "symbols": ["2308", "3665", "2481"],
+        "keywords": ["台達", "貿聯", "強茂", "車用", "電力", "電源"],
+    },
+    "預設": {
+        "leads": ["NVDA", "AAPL"],
+        "symbols": [],
+        "keywords": [],
+    },
+}
 
-    回傳 {"NVDA": {capex_yoy, doi, doi_change}, "AAPL": {...}, "text": 摘要文字}
+
+def get_industry_lead(symbol: str, name: str = "") -> tuple[str, list]:
+    """根據台股標的代號或名稱，回傳所屬產業類別與對應的上游美股龍頭。
+
+    代號比對優先，其次用名稱關鍵字，皆未命中時回傳「預設」(NVDA, AAPL)。
+    """
+    code = str(symbol or "").split(".")[0].strip().upper()
+    label = str(name or "")
+
+    # 1) 代號比對
+    for category, cfg in INDUSTRY_LEADS.items():
+        if code and code in cfg["symbols"]:
+            return category, list(cfg["leads"])
+
+    # 2) 名稱關鍵字比對
+    for category, cfg in INDUSTRY_LEADS.items():
+        if label and any(kw in label for kw in cfg["keywords"]):
+            return category, list(cfg["leads"])
+
+    # 3) 預設
+    default = INDUSTRY_LEADS["預設"]
+    return "預設", list(default["leads"])
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_us_lead_indicators(ticker_symbol: str = "", stock_name: str = "") -> dict:
+    """依產業別抓取對應 2 支上游美股最新財報，計算 CapEx 年增率與庫存天數(DOI)趨勢。
+
+    產業對應見 INDUSTRY_LEADS（AI/伺服器→NVDA,MSFT；半導體→ASML,AMAT；
+    網通→ANET,CSCO；車用/電力→TSLA,ON；預設→NVDA,AAPL）。
+
+    回傳 {"NVDA": {capex_yoy, doi, doi_change}, ..., "category": 產業類別,
+          "leads": [美股代號...], "text": 摘要文字}
     - capex_yoy  ：資本支出年增率 %（最新一季 vs 去年同季）
     - doi        ：庫存天數 = 季末庫存 / 季 COGS * 91.25
     - doi_change ：庫存天數較去年同期變化（天）
     """
+    category, leads = get_industry_lead(ticker_symbol, stock_name)
     result = {
-        "NVDA": {"capex_yoy": None, "doi": None, "doi_change": None},
-        "AAPL": {"capex_yoy": None, "doi": None, "doi_change": None},
+        ticker_id: {"capex_yoy": None, "doi": None, "doi_change": None}
+        for ticker_id in leads
     }
+    result["category"] = category
+    result["leads"] = list(leads)
 
-    for ticker_id in ("NVDA", "AAPL"):
+    for ticker_id in leads:
         info = result[ticker_id]
         try:
             tk = yf.Ticker(ticker_id)
@@ -506,8 +566,8 @@ def fetch_us_lead_indicators() -> dict:
             pass
 
     # --- 組成給 Prompt / 畫面用的摘要文字 ---
-    lines = []
-    for ticker_id in ("NVDA", "AAPL"):
+    lines = [f"- 產業類別：{category}（上游美股：{' / '.join(leads)}）"]
+    for ticker_id in leads:
         info = result[ticker_id]
         capex, doi, change = info["capex_yoy"], info["doi"], info["doi_change"]
         parts = [
@@ -727,10 +787,13 @@ def analyze_stock_with_gemini(stock_name, stock_symbol, tech_summary: str = ""):
     # 資料備援：呼叫 Gemini 前，先從 yfinance 抓真實財報數據
     fund = fetch_fundamentals(stock_symbol)
 
-    # 領先指標：上游巨頭 CapEx/DOI 與該股月營收二階加速度
-    us_lead = fetch_us_lead_indicators()
+    # 領先指標：依產業別抓對應上游美股 CapEx/DOI 與該股月營收二階加速度
+    us_lead = fetch_us_lead_indicators(stock_symbol, stock_name)
     rev_accel = calculate_revenue_acceleration(stock_symbol)
-    us_lead_text = us_lead.get("text") or "（NVDA/AAPL 領先指標資料暫時無法取得）"
+    lead_category = us_lead.get("category", "預設")
+    lead_tickers = us_lead.get("leads") or ["NVDA", "AAPL"]
+    lead_names = " / ".join(lead_tickers)
+    us_lead_text = us_lead.get("text") or f"（{lead_names} 領先指標資料暫時無法取得）"
     rev_accel_text = rev_accel.get("text") or "（月營收領先指標資料暫時無法取得）"
 
     prompt = f"""你是台股資深研究員，擅長基本面、技術面與題材面的綜合判斷。
@@ -743,7 +806,7 @@ def analyze_stock_with_gemini(stock_name, stock_symbol, tech_summary: str = ""):
 【近期網路新聞與法說摘要】
 {news_block}
 
-【上游領先指標（NVDA/AAPL 客觀財報數據，請直接引用）】
+【上游領先指標（該股產業類別：{lead_category}，上游美股 {lead_names} 客觀財報數據，請直接引用）】
 {us_lead_text}
 
 【台廠月營收領先指標（近3月 YoY 與二階加速度）】
@@ -757,7 +820,7 @@ def analyze_stock_with_gemini(stock_name, stock_symbol, tech_summary: str = ""):
   "future_dynamics": "【3. 未來動態性】最新接單情況、訂單能見度、新產品與研發進度，條列，200字內",
   "chip_insight": "【籌碼面洞察】近5~10個交易日三大法人（外資/投信/自營）買賣超動向、千張大戶持股比率與總股東人數變化、籌碼集中或散亂判讀，條列120字內",
   "chip_alert": "若發現籌碼與股價背離（主力暗中建倉：籌碼集中但股價未漲／主力拉高出貨：散戶接盤），填『前瞻籌碼警訊：...』60字內；沒有發現則填空字串 \"\"",
-  "leading_outlook": "前瞻供應鏈領先訊號摘要：結合 NVDA/AAPL 的 CapEx 與庫存天數、以及台廠月營收二階加速度，說明美股客戶拉貨狀況對該台股未來 3-6 個月訂單的實質影響，150字內",
+  "leading_outlook": "前瞻供應鏈領先訊號摘要：結合上游美股 {lead_names} 的 CapEx 與庫存天數、以及台廠月營收二階加速度，說明該產業美股客戶/上游設備投資動向對該台股未來 3-6 個月訂單的實質影響，150字內",
   "surprise_status": "四選一：強烈超預期 🚀 / 符合預期 ⚖️ / 低於預期 ⚠️ / 資料不足 ❓",
   "surprise_rate": 驚喜度百分比數字（公式：（實際-預期）/預期×100，以最新一季 EPS 計算，保留兩位小數；無法計算時填 null）,
   "surprise_is_estimate": true或false（true=預估基準為推估、false=市場法人共識數字）,
@@ -778,7 +841,7 @@ def analyze_stock_with_gemini(stock_name, stock_symbol, tech_summary: str = ""):
 7. 語氣務實，不得有保證獲利的字眼。
 8. **【籌碼面 (Market Capital Flow)】請主動檢索**：近 5~10 個交易日**三大法人（外資、投信、自營商）的買賣超動向**（例如：外資連續賣超、投信連續買超/逢低布局），以及「**千張大戶持股比率**」與「**總股東人數**」的近期變化，判讀籌碼是趨於集中還是沉澱散亂。
 9. **【籌碼融合與背離警訊】**將上述籌碼動向融入 `buy_timing`（買進時機點）與 `future_dynamics`（未來動態性）的評估中；若發現「**主力暗中建倉（籌碼集中但股價未漲）**」或「**主力逢高拉高出貨（散戶接盤）**」等籌碼與股價背離狀況，必須在 `chip_alert` 填入「前瞻籌碼警訊」加以提示，否則填空字串。
-10. **【領先指標】**必須結合上方「NVDA/AAPL CapEx 與庫存天數」與「台廠月營收二階加速度」兩項客觀數據，在 `leading_outlook` 產出 **150 字內**的前瞻供應鏈領先訊號摘要，具體說明美股客戶拉貨狀況對該台股未來 3-6 個月訂單的實質影響；數據若缺失請如實註明，不得虛構。"""
+10. **【領先指標】**必須結合上方「上游美股 {lead_names} 的 CapEx 與庫存天數」與「台廠月營收二階加速度」兩項客觀數據，在 `leading_outlook` 產出 **150 字內**的前瞻供應鏈領先訊號摘要，具體說明該產業上游/客戶端動向對該台股未來 3-6 個月訂單的實質影響；數據若缺失請如實註明，不得虛構。"""
 
     try:
         client = genai.Client(api_key=api_key)
@@ -938,18 +1001,23 @@ def render_surprise_block(result: dict) -> None:
 def render_leading_block(result: dict, symbol: str, label: str) -> None:
     """呈現「🔮 供應鏈與營收領先指標」卡片區塊。
 
-    - 上方 st.metric：NVDA/AAPL CapEx 年增率與庫存天數變化（即時運算、快取 6h）
+    - 上方 st.metric：依產業別動態抓取的上游美股 CapEx 年增率與庫存天數變化
+      （INDUSTRY_LEADS 對應，即時運算、快取 6h）
     - 中段：台股月營收二階加速度狀態與動能燈號
     - 下方 st.info：Gemini 提煉的未來 3-6 個月訂單前瞻展望
     """
     with st.expander("🔮 供應鏈與營收領先指標 (Leading Signal Model)", expanded=True):
-        us = fetch_us_lead_indicators()
+        us = fetch_us_lead_indicators(symbol, label)
         accel = calculate_revenue_acceleration(symbol)
+        lead_category = us.get("category", "預設")
+        lead_tickers = us.get("leads") or ["NVDA", "AAPL"]
 
-        # --- 上游巨頭領先指標 ---
-        st.markdown("**🏭 上游巨頭領先指標（NVDA / AAPL 最新財報）**")
-        cols = st.columns(4)
-        for i, name in enumerate(("NVDA", "AAPL")):
+        # --- 上游巨頭領先指標（標題依產業動態切換） ---
+        st.markdown(
+            f"**🏭 {lead_category}上游領先指標 ({' / '.join(lead_tickers)} 最新財報)**"
+        )
+        cols = st.columns(2 * len(lead_tickers))
+        for i, name in enumerate(lead_tickers):
             info = us.get(name) or {}
             capex = info.get("capex_yoy")
             doi = info.get("doi")
