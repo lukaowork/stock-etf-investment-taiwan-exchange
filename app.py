@@ -27,6 +27,14 @@ except Exception:
     feedparser = None
     FEEDPARSER_AVAILABLE = False
 
+# st-gsheets-connection 為可選套件，未安裝時自選股改存本機 session_state
+try:
+    from streamlit_gsheets import GSheetsConnection
+    GSHEETS_AVAILABLE = True
+except Exception:
+    GSheetsConnection = None
+    GSHEETS_AVAILABLE = False
+
 # 1. 頁面配置
 st.set_page_config(
     page_title="台股與 ETF 專屬投資研報系統",
@@ -77,6 +85,152 @@ if not check_password():
     st.stop()  # 未驗證成功則中斷後續程式碼執行
 
 # ---------------------------------------------------------
+# 2.5 Google Sheets 串接（st-gsheets-connection）
+# ---------------------------------------------------------
+GSHEETS_SPREADSHEET = (
+    "https://docs.google.com/spreadsheets/d/"
+    "11LXIBpOyjvqIrvzjkyoyc0pZSulI3D0in0va2cfi0aI/edit?usp=sharing"
+)
+
+
+def get_gsheets_connection():
+    """建立 st.connection("gsheets")；未安裝套件或未設定 secrets 時回傳 None。"""
+    if not GSHEETS_AVAILABLE:
+        return None
+    try:
+        return st.connection("gsheets", type=GSheetsConnection)
+    except Exception:
+        return None
+
+
+def _gsheets_is_crud() -> bool:
+    """是否為服務帳戶 CRUD 模式（可讀寫）；唯讀公開連結只能讀取。"""
+    try:
+        cfg = st.secrets["connections"]["gsheets"]
+        try:
+            raw = cfg.get("type", "")
+        except Exception:
+            raw = cfg["type"] if "type" in cfg else ""
+        return str(raw).strip().lower() == "service_account"
+    except Exception:
+        return False
+
+
+def _sheet_frame(worksheet: str):
+    """讀取指定工作表為 DataFrame；失敗回傳 None。
+
+    - 服務帳戶模式：走 st.connection（可讀寫）
+    - 唯讀模式 / 未設定 secrets：走 Google Sheets 公開 gviz CSV 備援
+    """
+    if _gsheets_is_crud():
+        conn = get_gsheets_connection()
+        if conn is not None:
+            try:
+                df = conn.read(worksheet=worksheet, ttl=60)
+                if df is not None:
+                    return pd.DataFrame(df)
+            except Exception:
+                pass
+    try:
+        url = (
+            "https://docs.google.com/spreadsheets/d/"
+            "11LXIBpOyjvqIrvzjkyoyc0pZSulI3D0in0va2cfi0aI"
+            f"/gviz/tq?tqx=out:csv&sheet={worksheet}"
+        )
+        return pd.read_csv(url)
+    except Exception:
+        return None
+
+
+def load_watchlist_stocks() -> dict:
+    """讀取 Watchlist 工作表，轉成 {顯示名稱: yfinance代號}；失敗回傳空 dict。"""
+    df = _sheet_frame("Watchlist")
+    if df is None or df.empty:
+        return {}
+    df = df.rename(columns={c: str(c).strip().lower() for c in df.columns})
+    if "symbol" not in df.columns or "name" not in df.columns:
+        return {}
+
+    stocks = {}
+    for _, row in df.iterrows():
+        raw_symbol = str(row["symbol"]).strip().upper()
+        name = str(row["name"]).strip()
+        code = raw_symbol.split(".")[0]
+        if not code.isdigit() or not name or name.lower() == "nan":
+            continue
+        symbol = raw_symbol if raw_symbol.endswith((".TW", ".TWO")) else f"{code}.TW"
+        label = name if f"({code})" in name else f"{name} ({code})"
+        stocks[label] = symbol
+    return stocks
+
+
+def sync_watchlist_to_sheets() -> bool:
+    """把 session 中的自選股清單寫回 Watchlist 工作表，成功回傳 True。
+
+    需服務帳戶（type = "service_account"）才有寫入權限；
+    唯讀模式回 False，由呼叫端顯示提示。
+    """
+    if not _gsheets_is_crud():
+        return False
+    conn = get_gsheets_connection()
+    if conn is None:
+        return False
+    try:
+        # 讀回原表以保留 category / added_date 等既有欄位
+        original = None
+        try:
+            original = conn.read(worksheet="Watchlist", ttl=1)
+        except Exception:
+            original = None
+
+        def _cell(value, default: str) -> str:
+            """把 NaN / None / 空字串統一成預設值。"""
+            if value is None:
+                return default
+            text = str(value).strip()
+            if not text or text.lower() == "nan" or text.lower() == "nat":
+                return default
+            return text
+
+        orig_map = {}
+        if original is not None and not original.empty:
+            ocols = {str(c).strip().lower(): c for c in original.columns}
+            sym_col = ocols.get("symbol")
+            if sym_col is not None:
+                for _, r in original.iterrows():
+                    code = str(r[sym_col]).split(".")[0].strip()
+                    orig_map[code] = {
+                        key: r[col] for key, col in ocols.items() if key != "symbol"
+                    }
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        rows = []
+        for label, symbol in st.session_state["custom_stocks"].items():
+            code = symbol.split(".")[0]
+            name = label.rsplit(" (", 1)[0] if label.endswith(")") else label
+            prev = orig_map.get(code, {})
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "name": name,
+                    "category": _cell(prev.get("category"), "自訂"),
+                    "added_date": _cell(prev.get("added_date"), today),
+                }
+            )
+
+        df = pd.DataFrame(rows, columns=["symbol", "name", "category", "added_date"])
+        conn.update(worksheet="Watchlist", data=df)
+        return True
+    except Exception:
+        return False
+
+
+def fetch_transactions_frame():
+    """讀取 Transactions 工作表（庫存帳本來源），失敗回傳 None。"""
+    return _sheet_frame("Transactions")
+
+
+# ---------------------------------------------------------
 # 3. 登入成功後的主畫面
 # ---------------------------------------------------------
 
@@ -94,17 +248,33 @@ with top_col2:
 # ---------------------------------------------------------
 st.sidebar.header("⚙️ 控制面板")
 
-# 1. 使用 session_state 儲存股票選單字典，避免重新整理時消失
+# 1. 自選股清單：優先從 Google Sheets 的 Watchlist 工作表載入
 if "custom_stocks" not in st.session_state:
-    st.session_state["custom_stocks"] = {
-        "台積電 (2330)": "2330.TW",
-        "鴻海 (2317)": "2317.TW",
-        "聯發科 (2454)": "2454.TW",
-        "元大台灣50 (0050)": "0050.TW",
-        "國泰永續高股息 (00878)": "00878.TW",
-        "群益台灣精選高息 (00919)": "00919.TW",
-        "復華台灣科技優息 (00929)": "00929.TW"
-    }
+    sheet_stocks = load_watchlist_stocks()
+    if sheet_stocks:
+        st.session_state["custom_stocks"] = sheet_stocks
+        st.session_state["watchlist_from_sheets"] = True
+    else:
+        # Sheets 讀取失敗或為空時，退回內建預設清單
+        st.session_state["custom_stocks"] = {
+            "台積電 (2330)": "2330.TW",
+            "鴻海 (2317)": "2317.TW",
+            "聯發科 (2454)": "2454.TW",
+            "元大台灣50 (0050)": "0050.TW",
+            "國泰永續高股息 (00878)": "00878.TW",
+            "群益台灣精選高息 (00919)": "00919.TW",
+            "復華台灣科技優息 (00929)": "00929.TW"
+        }
+        st.session_state["watchlist_from_sheets"] = False
+
+# 側邊欄標示清單來源
+if st.session_state.get("watchlist_from_sheets"):
+    st.sidebar.caption("☁️ 自選股清單已連結 Google Sheets（Watchlist）")
+else:
+    st.sidebar.caption(
+        "⚠️ Google Sheets 未連結（讀取失敗或為空），目前使用本機預設清單；"
+        "新增/移除將嘗試寫回。"
+    )
 
 # 2. 手動新增股票的功能區
 with st.sidebar.expander("➕ 新增自選股票/ETF"):
@@ -139,6 +309,37 @@ with st.sidebar.expander("➕ 新增自選股票/ETF"):
                     # 不呼叫 st.rerun()，讓下方 multiselect 同一次執行就帶入新選項，
                     # 同時 st.success 的提示也能正常顯示
                     st.success(f"✅ 已成功新增 {formatted_label} → {clean_symbol}！")
+                    # 寫回 Google Sheets（需服務帳戶權限，失敗僅提示不中斷）
+                    if sync_watchlist_to_sheets():
+                        st.caption("☁️ 已同步寫回 Google Sheets（Watchlist）")
+                    else:
+                        st.caption("⚠️ 無法寫回 Google Sheets（唯讀模式或連線失敗），本次新增僅保留在本機。")
+
+# 2.5 手動移除股票的功能區（同步寫回 Google Sheets）
+with st.sidebar.expander("➖ 移除自選股票/ETF"):
+    if st.session_state["custom_stocks"]:
+        remove_options = list(st.session_state["custom_stocks"].keys())
+        # 防護：上次選取的標的已被移除時，先重設避免 selectbox 報錯
+        if st.session_state.get("remove_select") not in remove_options:
+            st.session_state["remove_select"] = remove_options[0]
+        remove_label = st.selectbox(
+            "選擇要移除的標的：",
+            options=remove_options,
+            key="remove_select",
+        )
+        if st.button("移除選定標的", use_container_width=True):
+            removed_symbol = st.session_state["custom_stocks"].pop(remove_label, None)
+            if removed_symbol is not None:
+                # 同步從勾選清單移除（multiselect 尚未建立，可安全修改 session_state）
+                if remove_label in st.session_state.get("watchlist", []):
+                    st.session_state["watchlist"].remove(remove_label)
+                st.success(f"🗑️ 已移除 {remove_label}")
+                if sync_watchlist_to_sheets():
+                    st.caption("☁️ 已同步寫回 Google Sheets（Watchlist）")
+                else:
+                    st.caption("⚠️ 無法寫回 Google Sheets（唯讀模式或連線失敗），本次移除僅保留在本機。")
+    else:
+        st.info("目前沒有可移除的標的。")
 
 # 下方對照的標的字典改為調用 session_state
 STOCK_DICT = st.session_state["custom_stocks"]
@@ -146,7 +347,13 @@ STOCK_DICT = st.session_state["custom_stocks"]
 # 3. 供使用者選擇要追蹤的股票
 # 預設值寫入 session_state（用 key 綁定），新增的股票可自動勾選
 if "watchlist" not in st.session_state:
-    st.session_state["watchlist"] = ["台積電 (2330)", "元大台灣50 (0050)"]
+    defaults = ["台積電 (2330)", "元大台灣50 (0050)"]
+    st.session_state["watchlist"] = [d for d in defaults if d in STOCK_DICT]
+
+# 清除已不存在於選單的勾選項目（避免 Sheets 內容變動後 multiselect 報錯）
+st.session_state["watchlist"] = [
+    label for label in st.session_state.get("watchlist", []) if label in STOCK_DICT
+]
 
 # 剛加入選單的股票自動加入勾選（此段在 multiselect 建立之前執行，符合 Streamlit 規則）
 if "pending_select" in st.session_state:
@@ -1073,8 +1280,194 @@ def render_leading_block(result: dict, symbol: str, label: str) -> None:
         )
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_latest_prices(symbol_list) -> dict:
+    """抓取多標的最新收盤價，回傳 {yfinance代號: 價格}（快取 5 分鐘）。"""
+    prices = {}
+    symbols = [s for s in dict.fromkeys(symbol_list) if s]
+    if not symbols:
+        return prices
+
+    # 主路徑：一次批次下載，用共用的 get_symbol_frame 拆欄
+    try:
+        data = yf.download(
+            symbols, period="5d", progress=False, group_by="ticker", threads=True
+        )
+        if data is not None and len(data) > 0:
+            for sym in symbols:
+                try:
+                    closes = get_symbol_frame(data, sym)["Close"].dropna()
+                    if len(closes):
+                        prices[sym] = float(closes.iloc[-1])
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    # 備援：批次失敗的標的改用 fast_info 單獨抓
+    for sym in symbols:
+        if sym in prices:
+            continue
+        try:
+            price = yf.Ticker(sym).fast_info["last_price"]
+            if price:
+                prices[sym] = float(price)
+        except Exception:
+            continue
+    return prices
+
+
+def _tx_is_closed(status) -> bool:
+    """判斷交易狀態是否為已賣出/已平倉（不計入目前持股）。"""
+    text = str(status or "").strip().lower()
+    if not text or text == "nan":
+        return False
+    # 明確標示持有/open 的狀態優先判為未賣出
+    if any(key in text for key in ("持有", "未賣", "hold", "holding", "open", "持股")):
+        return False
+    return any(key in text for key in ("賣", "sold", "closed", "平倉", "已實現"))
+
+
+def render_transactions_tab() -> None:
+    """📦 庫存帳本：讀取 Google Sheets Transactions，結合 yfinance 計算即時市值與未實現損益。"""
+    st.subheader("📦 庫存帳本（Google Sheets Transactions）")
+
+    tx = fetch_transactions_frame()
+    if tx is None or tx.empty:
+        st.info(
+            "📝 目前 Google Sheets 的 `Transactions` 工作表沒有交易資料，或無法讀取。\n\n"
+            "請在試算表中建立 `Transactions` 工作表，表頭為："
+            "`symbol, name, buy_date, buy_price, shares, current_status`"
+        )
+        return
+
+    # 欄位正規化（相容英文與中文表頭）
+    tx = tx.rename(columns={c: str(c).strip().lower() for c in tx.columns})
+    alias = {
+        "代號": "symbol", "股票代號": "symbol",
+        "名稱": "name", "股票名稱": "name",
+        "買進日期": "buy_date", "成交日期": "buy_date",
+        "買進價格": "buy_price", "成本價": "buy_price", "均價": "buy_price",
+        "股數": "shares", "數量": "shares", "持股": "shares",
+        "狀態": "current_status", "目前狀態": "current_status",
+    }
+    tx = tx.rename(columns={k: v for k, v in alias.items() if k in tx.columns})
+
+    required = ["symbol", "buy_price", "shares"]
+    missing = [c for c in required if c not in tx.columns]
+    if missing:
+        st.error(
+            f"❌ Transactions 工作表缺少必要欄位：{', '.join(missing)}\n\n"
+            "必要表頭：`symbol, name, buy_date, buy_price, shares, current_status`"
+        )
+        st.dataframe(tx, use_container_width=True)
+        return
+
+    # 整理資料
+    tx["symbol"] = tx["symbol"].astype(str).str.strip().str.upper()
+    tx["symbol"] = tx["symbol"].apply(
+        lambda s: s if s.endswith((".TW", ".TWO")) else (f"{s}.TW" if s.split(".")[0].isdigit() else s)
+    )
+    tx["buy_price"] = pd.to_numeric(tx["buy_price"], errors="coerce")
+    tx["shares"] = pd.to_numeric(tx["shares"], errors="coerce")
+    if "name" not in tx.columns:
+        tx["name"] = tx["symbol"]
+    if "current_status" not in tx.columns:
+        tx["current_status"] = ""
+    if "buy_date" not in tx.columns:
+        tx["buy_date"] = ""
+
+    bad = tx["buy_price"].isna() | tx["shares"].isna() | (tx["shares"] <= 0)
+    if bad.any():
+        st.warning(f"⚠️ 有 {int(bad.sum())} 筆交易的買進價格或股數無法解析，已略過。")
+        tx = tx[~bad].copy()
+
+    if tx.empty:
+        st.info("📝 沒有可計算的有效交易紀錄。")
+        return
+
+    # 抓即時股價並計算市值與損益
+    with st.spinner("📡 正在抓取即時股價..."):
+        prices = fetch_latest_prices(tx["symbol"].tolist())
+
+    tx["現價"] = tx["symbol"].map(prices)
+    tx["持股成本"] = tx["buy_price"] * tx["shares"]
+    tx["目前市值"] = tx["現價"] * tx["shares"]
+    tx["未實現損益"] = tx["目前市值"] - tx["持股成本"]
+    tx["ROI %"] = (tx["未實現損益"] / tx["持股成本"] * 100).round(2)
+    tx["已賣出"] = tx["current_status"].apply(_tx_is_closed)
+
+    holdings = tx[~tx["已賣出"]].copy()
+    missing_price = holdings["現價"].isna()
+    if missing_price.any():
+        st.warning(
+            f"⚠️ {int(missing_price.sum())} 檔標的抓不到即時股價，相關欄位顯示為 N/A，"
+            "且未計入總計。"
+        )
+        holdings = holdings[~missing_price]
+
+    # ---- 上方總覽指標 ----
+    total_cost = holdings["持股成本"].sum()
+    total_value = holdings["目前市值"].sum()
+    total_pl = holdings["未實現損益"].sum()
+    total_roi = (total_pl / total_cost * 100) if total_cost else 0.0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("🏦 持股總成本", f"{total_cost:,.0f} 元")
+    c2.metric("💰 目前總市值", f"{total_value:,.0f} 元")
+    c3.metric("📈 未實現損益", f"{total_pl:+,.0f} 元", delta=f"{total_roi:+.2f}%")
+    c4.metric("🎯 整體 ROI", f"{total_roi:+.2f}%",
+              delta=f"{len(holdings)} 檔持股" if len(holdings) else "無持股")
+
+    st.divider()
+
+    # ---- 持股明細表 ----
+    st.markdown("**📋 目前持股明細**")
+    detail = tx.copy()
+    detail["狀態"] = detail["current_status"].apply(lambda s: "✅ 持有" if not _tx_is_closed(s) else "✔️ 已賣出")
+    show_cols = ["symbol", "name", "buy_date", "buy_price", "shares", "現價",
+                 "持股成本", "目前市值", "未實現損益", "ROI %", "狀態"]
+    show_cols = [c for c in show_cols if c in detail.columns]
+    display_df = detail[show_cols].sort_values("symbol")
+
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            key: cfg
+            for key, cfg in {
+                "buy_price": st.column_config.NumberColumn("買進價", format="%.2f"),
+                "shares": st.column_config.NumberColumn("股數", format="%.0f"),
+                "現價": st.column_config.NumberColumn("即時股價", format="%.2f"),
+                "持股成本": st.column_config.NumberColumn("持股成本", format="%.0f"),
+                "目前市值": st.column_config.NumberColumn("目前市值", format="%.0f"),
+                "未實現損益": st.column_config.NumberColumn("未實現損益", format="%.0f"),
+                "ROI %": st.column_config.NumberColumn("ROI %", format="%.2f%%"),
+            }.items()
+            if key in display_df.columns
+        },
+    )
+
+    csv_data = display_df.to_csv(encoding="utf-8-sig")
+    st.download_button(
+        label="⬇️ 下載庫存帳本明細 (CSV)",
+        data=csv_data,
+        file_name=f"portfolio_{datetime.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv",
+    )
+
+    st.caption(
+        "📎 資料來源：Google Sheets `Transactions` 工作表 + yfinance 即時股價"
+        "（股價快取 5 分鐘）；未實現損益僅計入尚未賣出的持股。"
+    )
+
+
 if not selected_labels:
     st.warning("👈 請於左側邊欄選擇至少一檔股票或 ETF 開始載入數據。")
+    # 未選擇標的時，仍可查看庫存帳本
+    st.divider()
+    render_transactions_tab()
 else:
     symbols = [STOCK_DICT[label] for label in selected_labels]
 
@@ -1103,13 +1496,14 @@ else:
         frames[label] = get_symbol_frame(data_raw, sym)
 
 
-    # 主畫面 5 大分頁
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    # 主畫面 6 大分頁
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "📊 核心觀察",
         "📈 K線與技術分析",
         "⚖️ 多標的走勢對比",
         "📋 歷史數據明細",
         "🤖 AI 股市三健檢與動態分析",
+        "📦 庫存帳本",
     ])
 
     # -----------------------------------------------------
@@ -1325,3 +1719,9 @@ else:
             "📎 資料來源：Google News RSS 近期新聞標題、本機行情計算之 20MA/60MA 均線位階，"
             f"並由 {GEMINI_MODEL} 綜合研判。"
         )
+
+    # -----------------------------------------------------
+    # Tab 6: 庫存帳本 (Google Sheets Transactions + yfinance)
+    # -----------------------------------------------------
+    with tab6:
+        render_transactions_tab()

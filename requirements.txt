@@ -6,3 +6,4 @@ google-genai
 feedparser
 beautifulsoup4
 requests
+st-gsheets-connection
