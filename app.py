@@ -492,6 +492,9 @@ def _parse_analysis(text: str):
         "expected_revenue": str(data.get("expected_revenue", "") or "").strip(),
         "actual_revenue": str(data.get("actual_revenue", "") or "").strip(),
         "surprise_outlook": str(data.get("surprise_outlook", "") or "").strip(),
+        # 籌碼面（Market Capital Flow）欄位
+        "chip_insight": str(data.get("chip_insight", "") or "").strip(),
+        "chip_alert": str(data.get("chip_alert", "") or "").strip(),
     }
 
 
@@ -528,6 +531,8 @@ def analyze_stock_with_gemini(stock_name, stock_symbol, tech_summary: str = ""):
   "company_health": "【1. 公司健康度】評分理由、基本面護城河與主要風險，條列白話，200字內",
   "buy_timing": "【2. 買進時機點】結合當前股價與 20MA/60MA 位階，給明確的進場/觀望策略與停損思考，白話，200字內",
   "future_dynamics": "【3. 未來動態性】最新接單情況、訂單能見度、新產品與研發進度，條列，200字內",
+  "chip_insight": "【籌碼面洞察】近5~10個交易日三大法人（外資/投信/自營）買賣超動向、千張大戶持股比率與總股東人數變化、籌碼集中或散亂判讀，條列120字內",
+  "chip_alert": "若發現籌碼與股價背離（主力暗中建倉：籌碼集中但股價未漲／主力拉高出貨：散戶接盤），填『前瞻籌碼警訊：...』60字內；沒有發現則填空字串 \"\"",
   "surprise_status": "四選一：強烈超預期 🚀 / 符合預期 ⚖️ / 低於預期 ⚠️ / 資料不足 ❓",
   "surprise_rate": 驚喜度百分比數字（公式：（實際-預期）/預期×100，以最新一季 EPS 計算，保留兩位小數；無法計算時填 null）,
   "surprise_is_estimate": true或false（true=預估基準為推估、false=市場法人共識數字）,
@@ -545,7 +550,9 @@ def analyze_stock_with_gemini(stock_name, stock_symbol, tech_summary: str = ""):
 4. **狀態判斷基準**：驚喜度 > 5% →「強烈超預期 🚀」；-5% ~ +5% →「符合預期 ⚖️」；< -5% →「低於預期 ⚠️」。
 5. **除非完全沒有任何財務數據，否則不要輕易輸出 N/A**；只有查無任何實際與可推估數據時，才填「資料不足 ❓」與 null，嚴禁虛構確定性數字。
 6. 新聞若不足，請明確寫「網路資料有限」，不得把不確定資訊寫成確定事實。
-7. 語氣務實，不得有保證獲利的字眼。"""
+7. 語氣務實，不得有保證獲利的字眼。
+8. **【籌碼面 (Market Capital Flow)】請主動檢索**：近 5~10 個交易日**三大法人（外資、投信、自營商）的買賣超動向**（例如：外資連續賣超、投信連續買超/逢低布局），以及「**千張大戶持股比率**」與「**總股東人數**」的近期變化，判讀籌碼是趨於集中還是沉澱散亂。
+9. **【籌碼融合與背離警訊】**將上述籌碼動向融入 `buy_timing`（買進時機點）與 `future_dynamics`（未來動態性）的評估中；若發現「**主力暗中建倉（籌碼集中但股價未漲）**」或「**主力逢高拉高出貨（散戶接盤）**」等籌碼與股價背離狀況，必須在 `chip_alert` 填入「前瞻籌碼警訊」加以提示，否則填空字串。"""
 
     try:
         client = genai.Client(api_key=api_key)
@@ -606,15 +613,36 @@ SAMPLE_ANALYSIS = {
         "（靜態範例）單季 EPS 與營收雙雙超越法人預期，高股息標的易吸引法人上修目標價、"
         "並於除息前引發追價買盤；惟電信股股性平穩，驚喜度對股價的推升多屬溫和補漲而非飆漲。"
     ),
+    # 籌碼面（靜態範例）
+    "chip_insight": (
+        "（靜態範例）\n"
+        "• **三大法人近 5~10 日**：外資小幅賣超累計約 2,300 張，投信連 3 日買超、自營小幅調節。\n"
+        "• **千張大戶持股比率**：由 61.2% 微升至 61.6%，籌碼略趨集中。\n"
+        "• **總股東人數**：單週微增 0.4%，散戶增加有限，整體屬『集中微升、未見過度散亂』。"
+    ),
+    "chip_alert": "",  # 未見籌碼與股價背離，故不發出警訊
 }
 
 
 def render_analysis_cards(result: dict) -> None:
-    """將三健檢結果渲染為 info / warning / success 三張卡片。"""
+    """將三健檢結果渲染為 info / warning / success 卡片，並附籌碼面洞察卡。"""
     score = result.get("health_score", 0)
     st.info(f"**🏥 【1. 公司健康度】**　評分 **{score}/100**  \n{result['company_health']}")
     st.warning(f"**⏱️ 【2. 買進時機點】**  \n{result['buy_timing']}")
     st.success(f"**🚀 【3. 未來動態性】**  \n{result['future_dynamics']}")
+
+    # 📊 籌碼面洞察（三大法人動向 + 大戶集中度，含前瞻籌碼警訊）
+    chip_insight = str(result.get("chip_insight", "") or "").strip()
+    chip_alert = str(result.get("chip_alert", "") or "").strip()
+    if chip_insight or chip_alert:
+        with st.container(border=True):
+            st.markdown(
+                "**📊 籌碼面洞察：法人連買/連賣與大戶集中度 (Market Capital Flow)**"
+            )
+            if chip_insight:
+                st.markdown(chip_insight)
+            if chip_alert:
+                st.warning(chip_alert)
 
 
 def render_surprise_block(result: dict) -> None:
