@@ -1,0 +1,2 @@
+# 不要將密碼設定檔提交到 Git
+.streamlit/secrets.toml
