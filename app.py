@@ -167,62 +167,77 @@ def load_watchlist_stocks() -> dict:
 def sync_watchlist_to_sheets() -> bool:
     """把 session 中的自選股清單寫回 Watchlist 工作表，成功回傳 True。
 
-    需服務帳戶（type = "service_account"）才有寫入權限；
-    唯讀模式回 False，由呼叫端顯示提示。
+    - 需服務帳戶（type = "service_account"）才有寫入權限
+    - 寫入成功後執行 st.cache_data.clear()，確保立即重新讀取最新數據
+    - 失敗時丟出 Exception（含詳細原因），由呼叫端以 st.error 顯示
     """
     if not _gsheets_is_crud():
-        return False
+        raise Exception(
+            '目前為唯讀模式（secrets 未設定 type = "service_account"），'
+            "沒有 Google Sheets 寫入權限；請於 .streamlit/secrets.toml 的 "
+            "[connections.gsheets] 設定服務帳戶金鑰並分享試算表給 client_email。"
+        )
+
     conn = get_gsheets_connection()
     if conn is None:
-        return False
+        raise Exception(
+            '無法建立 st.connection("gsheets")，請確認已安裝 st-gsheets-connection，'
+            "並於 .streamlit/secrets.toml 設定 [connections.gsheets]。"
+        )
+
+    # 讀回原表以保留 category / added_date 等既有欄位
+    original = None
     try:
-        # 讀回原表以保留 category / added_date 等既有欄位
-        original = None
-        try:
-            original = conn.read(worksheet="Watchlist", ttl=1)
-        except Exception:
-            original = None
-
-        def _cell(value, default: str) -> str:
-            """把 NaN / None / 空字串統一成預設值。"""
-            if value is None:
-                return default
-            text = str(value).strip()
-            if not text or text.lower() == "nan" or text.lower() == "nat":
-                return default
-            return text
-
-        orig_map = {}
-        if original is not None and not original.empty:
-            ocols = {str(c).strip().lower(): c for c in original.columns}
-            sym_col = ocols.get("symbol")
-            if sym_col is not None:
-                for _, r in original.iterrows():
-                    code = str(r[sym_col]).split(".")[0].strip()
-                    orig_map[code] = {
-                        key: r[col] for key, col in ocols.items() if key != "symbol"
-                    }
-
-        today = datetime.now().strftime("%Y-%m-%d")
-        rows = []
-        for label, symbol in st.session_state["custom_stocks"].items():
-            code = symbol.split(".")[0]
-            name = label.rsplit(" (", 1)[0] if label.endswith(")") else label
-            prev = orig_map.get(code, {})
-            rows.append(
-                {
-                    "symbol": symbol,
-                    "name": name,
-                    "category": _cell(prev.get("category"), "自訂"),
-                    "added_date": _cell(prev.get("added_date"), today),
-                }
-            )
-
-        df = pd.DataFrame(rows, columns=["symbol", "name", "category", "added_date"])
-        conn.update(worksheet="Watchlist", data=df)
-        return True
+        original = conn.read(worksheet="Watchlist", ttl=1)
     except Exception:
-        return False
+        original = None
+
+    def _cell(value, default: str) -> str:
+        """把 NaN / None / 空字串統一成預設值。"""
+        if value is None:
+            return default
+        text = str(value).strip()
+        if not text or text.lower() == "nan" or text.lower() == "nat":
+            return default
+        return text
+
+    orig_map = {}
+    if original is not None and not original.empty:
+        ocols = {str(c).strip().lower(): c for c in original.columns}
+        sym_col = ocols.get("symbol")
+        if sym_col is not None:
+            for _, r in original.iterrows():
+                code = str(r[sym_col]).split(".")[0].strip()
+                orig_map[code] = {
+                    key: r[col] for key, col in ocols.items() if key != "symbol"
+                }
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    rows = []
+    for label, symbol in st.session_state["custom_stocks"].items():
+        code = symbol.split(".")[0]
+        name = label.rsplit(" (", 1)[0] if label.endswith(")") else label
+        prev = orig_map.get(code, {})
+        rows.append(
+            {
+                "symbol": symbol,
+                "name": name,
+                "category": _cell(prev.get("category"), "自訂"),
+                "added_date": _cell(prev.get("added_date"), today),
+            }
+        )
+
+    updated_df = pd.DataFrame(rows, columns=["symbol", "name", "category", "added_date"])
+
+    try:
+        conn.update(worksheet="Watchlist", data=updated_df)
+    except Exception as e:
+        # 帶出明確的 Exception 內容，避免只顯示模糊警告
+        raise Exception(f"{type(e).__name__}: {e}") from e
+
+    # 寫入成功後清除快取，確保 Streamlit 立即重新讀取最新數據
+    st.cache_data.clear()
+    return True
 
 
 def fetch_transactions_frame():
@@ -309,11 +324,15 @@ with st.sidebar.expander("➕ 新增自選股票/ETF"):
                     # 不呼叫 st.rerun()，讓下方 multiselect 同一次執行就帶入新選項，
                     # 同時 st.success 的提示也能正常顯示
                     st.success(f"✅ 已成功新增 {formatted_label} → {clean_symbol}！")
-                    # 寫回 Google Sheets（需服務帳戶權限，失敗僅提示不中斷）
-                    if sync_watchlist_to_sheets():
-                        st.caption("☁️ 已同步寫回 Google Sheets（Watchlist）")
+
+                    # 寫回 Google Sheets：conn.update(worksheet="Watchlist", data=updated_df)
+                    # 成功後由 sync_watchlist_to_sheets() 內部執行 st.cache_data.clear()
+                    try:
+                        sync_watchlist_to_sheets()
+                    except Exception as e:
+                        st.error(f"寫入 Google Sheets 失敗，詳細原因：{e}")
                     else:
-                        st.caption("⚠️ 無法寫回 Google Sheets（唯讀模式或連線失敗），本次新增僅保留在本機。")
+                        st.caption("☁️ 已同步寫回 Google Sheets（Watchlist），快取已清除")
 
 # 2.5 手動移除股票的功能區（同步寫回 Google Sheets）
 with st.sidebar.expander("➖ 移除自選股票/ETF"):
@@ -334,10 +353,12 @@ with st.sidebar.expander("➖ 移除自選股票/ETF"):
                 if remove_label in st.session_state.get("watchlist", []):
                     st.session_state["watchlist"].remove(remove_label)
                 st.success(f"🗑️ 已移除 {remove_label}")
-                if sync_watchlist_to_sheets():
-                    st.caption("☁️ 已同步寫回 Google Sheets（Watchlist）")
+                try:
+                    sync_watchlist_to_sheets()
+                except Exception as e:
+                    st.error(f"寫入 Google Sheets 失敗，詳細原因：{e}")
                 else:
-                    st.caption("⚠️ 無法寫回 Google Sheets（唯讀模式或連線失敗），本次移除僅保留在本機。")
+                    st.caption("☁️ 已同步寫回 Google Sheets（Watchlist），快取已清除")
     else:
         st.info("目前沒有可移除的標的。")
 
