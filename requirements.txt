@@ -1,7 +1,8 @@
-streamlit>=1.32
-yfinance>=0.2.40
-plotly>=5.18
-pandas>=2.0
-requests>=2.31
-feedparser>=6.0
-google-genai>=0.3
+streamlit
+yfinance
+plotly
+pandas
+google-genai
+feedparser
+beautifulsoup4
+requests
