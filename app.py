@@ -267,6 +267,16 @@ def _build_tech_summary(df: pd.DataFrame) -> str:
     return "；".join(parts) + "。"
 
 
+def _to_number(value):
+    """把模型回傳的數值（數字或 '12.5%' 類字串）轉成 float，失敗回傳 None。"""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    match = re.search(r"-?\d+(?:\.\d+)?", str(value).replace(",", ""))
+    return float(match.group()) if match else None
+
+
 def _parse_analysis(text: str):
     """解析 Gemini 回傳的 JSON（容忍 markdown code fence 與雜訊）。"""
     if not text:
@@ -303,11 +313,19 @@ def _parse_analysis(text: str):
         "company_health": health or "（模型未回傳）",
         "buy_timing": timing or "（模型未回傳）",
         "future_dynamics": future or "（模型未回傳）",
+        # 財報與營收驚喜度（Earnings Surprise）欄位
+        "surprise_status": str(data.get("surprise_status", "")).strip(),
+        "surprise_rate": _to_number(data.get("surprise_rate")),
+        "expected_eps": str(data.get("expected_eps", "") or "").strip(),
+        "actual_eps": str(data.get("actual_eps", "") or "").strip(),
+        "expected_revenue": str(data.get("expected_revenue", "") or "").strip(),
+        "actual_revenue": str(data.get("actual_revenue", "") or "").strip(),
+        "surprise_outlook": str(data.get("surprise_outlook", "") or "").strip(),
     }
 
 
 def analyze_stock_with_gemini(stock_name, stock_symbol, tech_summary: str = ""):
-    """抓新聞 + 組 Prompt → 送 Gemini (gemini-3.8-flash)，回傳三健檢 dict。
+    """抓新聞 + 組 Prompt → 送 Gemini (gemini-3.8-flash)，回傳三健檢與財報驚喜度 dict。
 
     失敗時丟出例外，由呼叫端捕捉並顯示詳細錯誤訊息；
     僅在未安裝套件或未設定金鑰時回傳 None。
@@ -328,18 +346,28 @@ def analyze_stock_with_gemini(stock_name, stock_symbol, tech_summary: str = ""):
 【近期網路新聞與法說摘要】
 {news_block}
 
-回傳 JSON 格式（四個欄位都不可省略）：
+回傳 JSON 格式（四個區塊都不可省略）：
 {{
   "health_score": 0到100的整數,
   "company_health": "【1. 公司健康度】評分理由、基本面護城河與主要風險，條列白話，200字內",
   "buy_timing": "【2. 買進時機點】結合當前股價與 20MA/60MA 位階，給明確的進場/觀望策略與停損思考，白話，200字內",
-  "future_dynamics": "【3. 未來動態性】最新接單情況、訂單能見度、新產品與研發進度，條列，200字內"
+  "future_dynamics": "【3. 未來動態性】最新接單情況、訂單能見度、新產品與研發進度，條列，200字內",
+  "surprise_status": "四選一：強烈超預期 🚀 / 符合預期 ⚖️ / 低於預期 ⚠️ / 資料不足 ❓",
+  "surprise_rate": 驚喜度百分比數字（公式：（實際-預期）/預期×100，以最新一季 EPS 計算，保留兩位小數；無法計算時填 null）,
+  "expected_eps": "最新一季的市場法人預估 EPS（含季度與幣別）",
+  "actual_eps": "最新公佈的實際 EPS（含季度與幣別）",
+  "expected_revenue": "最新一季的市場法人預估營收（含單位）",
+  "actual_revenue": "最新公佈的實際營收（含單位）",
+  "surprise_outlook": "驚喜度對股價的前瞻影響：是否可能引發法人上修評等/目標價或追價買盤，120字內"
 }}
 
 要求：
-1. 三個核心指標必須涵蓋，缺一不可。
-2. 新聞若不足，請明確寫「網路資料有限」，不得把不確定資訊寫成確定事實。
-3. 語氣務實，不得有保證獲利的字眼。"""
+1. 三大核心指標與財報驚喜度區塊必須涵蓋，缺一不可。
+2. 【財報驚喜度】請檢索並對比市場**法人預估的 EPS / 營收**與公司**最新公佈的實際 EPS / 營收**，自行計算驚喜度百分比。
+3. 狀態判斷基準：驚喜度 > 5% →「強烈超預期 🚀」；-5% ~ +5% →「符合預期 ⚖️」；< -5% →「低於預期 ⚠️」。
+4. 若查不到可靠的預估或實際數字，surprise_status 填「資料不足 ❓」、surprise_rate 填 null、其餘財報欄位填「N/A」，**嚴禁虛構數字**。
+5. 新聞若不足，請明確寫「網路資料有限」，不得把不確定資訊寫成確定事實。
+6. 語氣務實，不得有保證獲利的字眼。"""
 
     try:
         client = genai.Client(api_key=api_key)
@@ -387,6 +415,17 @@ SAMPLE_ANALYSIS = {
         "• **新產品**：企業雲、資安與 IoT 服務為新動能。\n"
         "• **研發進度**：持續投入 5G 與光纖覆蓋擴充，資本支出維持穩定水準。"
     ),
+    # 財報與營收驚喜度（靜態範例）
+    "surprise_status": "強烈超預期 🚀",
+    "surprise_rate": 11.30,
+    "expected_eps": "1.15 元（2026 Q3）",
+    "actual_eps": "1.28 元（2026 Q3）",
+    "expected_revenue": "655.0 億（2026 Q3）",
+    "actual_revenue": "671.4 億（2026 Q3）",
+    "surprise_outlook": (
+        "（靜態範例）單季 EPS 與營收雙雙超越法人預期，高股息標的易吸引法人上修目標價、"
+        "並於除息前引發追價買盤；惟電信股股性平穩，驚喜度對股價的推升多屬溫和補漲而非飆漲。"
+    ),
 }
 
 
@@ -396,6 +435,61 @@ def render_analysis_cards(result: dict) -> None:
     st.info(f"**🏥 【1. 公司健康度】**　評分 **{score}/100**  \n{result['company_health']}")
     st.warning(f"**⏱️ 【2. 買進時機點】**  \n{result['buy_timing']}")
     st.success(f"**🚀 【3. 未來動態性】**  \n{result['future_dynamics']}")
+
+
+def render_surprise_block(result: dict) -> None:
+    """呈現「🎯 財報與營收驚喜度檢測」區塊（指標 + 狀態卡片）。"""
+    with st.expander("🎯 財報與營收驚喜度檢測 (Earnings Surprise Model)", expanded=True):
+        status = str(result.get("surprise_status", "")).strip() or "（模型未回傳狀態）"
+        rate = result.get("surprise_rate")
+
+        expected_eps = str(result.get("expected_eps", "") or "").strip() or "N/A"
+        actual_eps = str(result.get("actual_eps", "") or "").strip() or "N/A"
+        expected_rev = str(result.get("expected_revenue", "") or "").strip() or "N/A"
+        actual_rev = str(result.get("actual_revenue", "") or "").strip() or "N/A"
+
+        st.markdown(f"**驚喜度狀態：{status}**")
+
+        # 預期 EPS / 實際 EPS / 驚喜度差距
+        col_eps1, col_eps2, col_eps3 = st.columns(3)
+        col_eps1.metric("法人預期 EPS", expected_eps)
+        col_eps2.metric("實際公佈 EPS", actual_eps)
+        col_eps3.metric(
+            "驚喜度差距 %",
+            f"{rate:+.2f}%" if rate is not None else "N/A",
+            delta=f"{rate:+.2f}%" if rate is not None else None,
+        )
+
+        # 預期營收 / 實際營收
+        col_rev1, col_rev2 = st.columns(2)
+        col_rev1.metric("法人預期營收", expected_rev)
+        col_rev2.metric("實際公佈營收", actual_rev)
+
+        # 驚喜度狀態卡片（> 5% 綠色利多、< -5% 紅色警戒）
+        if rate is None:
+            st.info(
+                "❓ **無法計算驚喜度**：模型未取得可靠的法人預估或實際財報數字"
+                "（尚未進入財報季、或網路資料不足），請於財報公布後重試。"
+            )
+        elif rate > 5:
+            st.success(
+                f"🟢 **利多驚喜，具前瞻拉抬動能**（驚喜度 {rate:+.2f}%）："
+                "實績明顯優於法人預期，後續可留意目標價與評等是否上修。"
+            )
+        elif rate < -5:
+            st.error(
+                f"🔴 **低於預期，防範賣壓**（驚喜度 {rate:+.2f}%）："
+                "實績不如法人預期，短線可能面臨調節賣壓，建議保守觀察。"
+            )
+        else:
+            st.info(
+                f"⚖️ **符合預期**（驚喜度 {rate:+.2f}%）："
+                "實績落在法人預估區間內，股價反應應以既有趨勢為主。"
+            )
+
+        outlook = str(result.get("surprise_outlook", "") or "").strip()
+        if outlook:
+            st.markdown(f"**🔬 驚喜度對股價的前瞻影響：**  \n{outlook}")
 
 
 if not selected_labels:
@@ -632,12 +726,14 @@ else:
         if saved_result:
             st.caption(f"📊 以下為 **{focus_label_ai}** 最近一次的 AI 即時分析結果：")
             render_analysis_cards(saved_result)
+            render_surprise_block(saved_result)
         else:
             st.info(
                 "👆 尚未對此標的執行分析，以下先顯示 **靜態範例（中華電 2412）**；"
                 "點擊上方「🚀 開始 AI 健檢與情報分析」即可取得即時結果。"
             )
             render_analysis_cards(SAMPLE_ANALYSIS)
+            render_surprise_block(SAMPLE_ANALYSIS)
 
         # 底部警示與來源說明
         st.caption(
