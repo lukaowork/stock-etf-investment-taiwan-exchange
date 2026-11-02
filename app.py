@@ -435,6 +435,216 @@ def _apply_fundamentals(parsed: dict, fund: dict) -> dict:
     return parsed
 
 
+def _match_row(df: pd.DataFrame, candidates):
+    """在 DataFrame 中找出名稱符合候選字串的列（不區分大小寫）。"""
+    if df is None:
+        return None
+    lowered = {str(i).strip().lower(): i for i in df.index}
+    for cand in candidates:
+        if cand in lowered:
+            return lowered[cand]
+    for low, orig in lowered.items():
+        if any(cand in low for cand in candidates):
+            return orig
+    return None
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_us_lead_indicators() -> dict:
+    """yfinance 抓取 NVDA / AAPL 最新財報，計算 CapEx 年增率與庫存天數(DOI)趨勢。
+
+    回傳 {"NVDA": {capex_yoy, doi, doi_change}, "AAPL": {...}, "text": 摘要文字}
+    - capex_yoy  ：資本支出年增率 %（最新一季 vs 去年同季）
+    - doi        ：庫存天數 = 季末庫存 / 季 COGS * 91.25
+    - doi_change ：庫存天數較去年同期變化（天）
+    """
+    result = {
+        "NVDA": {"capex_yoy": None, "doi": None, "doi_change": None},
+        "AAPL": {"capex_yoy": None, "doi": None, "doi_change": None},
+    }
+
+    for ticker_id in ("NVDA", "AAPL"):
+        info = result[ticker_id]
+        try:
+            tk = yf.Ticker(ticker_id)
+        except Exception:
+            continue
+
+        # --- CapEx 年增率 ---
+        try:
+            cf = tk.quarterly_cash_flow
+            if cf is not None and not cf.empty:
+                row = _match_row(cf, ["capital expenditure", "capital exp"])
+                if row is not None:
+                    vals = [abs(float(v)) for v in cf.loc[row].dropna().tolist() if v]
+                    if len(vals) >= 5 and vals[4]:
+                        info["capex_yoy"] = (vals[0] - vals[4]) / abs(vals[4]) * 100
+        except Exception:
+            pass
+
+        # --- 庫存天數 DOI 與變化趨勢 ---
+        try:
+            bs = tk.quarterly_balance_sheet
+            inc = tk.quarterly_income_stmt
+            inv_row = _match_row(bs, ["inventory", "inventories"])
+            cogs_row = _match_row(inc, ["cost of revenue", "cost of sales"])
+            if inv_row is not None and cogs_row is not None:
+                inv = [float(v) for v in bs.loc[inv_row].dropna().tolist()]
+                cogs = [abs(float(v)) for v in inc.loc[cogs_row].dropna().tolist()]
+                dois = [
+                    inv[i] / cogs[i] * 91.25
+                    for i in range(min(len(inv), len(cogs)))
+                    if cogs[i]
+                ]
+                if dois:
+                    info["doi"] = dois[0]
+                    if len(dois) >= 5:  # 與去年同期（4 季前）比較
+                        info["doi_change"] = dois[0] - dois[4]
+                    elif len(dois) >= 2:  # 備援：與前一季比較
+                        info["doi_change"] = dois[0] - dois[1]
+        except Exception:
+            pass
+
+    # --- 組成給 Prompt / 畫面用的摘要文字 ---
+    lines = []
+    for ticker_id in ("NVDA", "AAPL"):
+        info = result[ticker_id]
+        capex, doi, change = info["capex_yoy"], info["doi"], info["doi_change"]
+        parts = [
+            f"{ticker_id}："
+            + (f"CapEx 年增率 {capex:+.1f}%" if capex is not None else "CapEx 年增率（資料不足）")
+        ]
+        if doi is not None:
+            trend = f"，較去年同期 {change:+.1f} 天" if change is not None else ""
+            parts.append(f"庫存天數 {doi:.1f} 天{trend}")
+        else:
+            parts.append("庫存天數（資料不足）")
+        lines.append("- " + "，".join(parts))
+    result["text"] = "\n".join(lines)
+    return result
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def calculate_revenue_acceleration(symbol: str) -> dict:
+    """取得台股近 3 個月月營收 YoY，計算營收二階加速度並判定動能狀態。
+
+    Acceleration = YoY_t - 2 × YoY_(t-1) + YoY_(t-2)
+    狀態：【🚀 訂單剛爆發 (加速度正向)】/【⚖️ 穩健成長】/【⚠️ 成長減速中】
+    主資料源：FinMind 月營收（免 token、有速率限制）
+    備援：TWSE OpenAPI 單月營收（僅最新一個月，無法算加速度）
+    """
+    code = symbol.split(".")[0]
+    out = {
+        "code": code,
+        "yoy_list": [],          # 近 3 個月 YoY（舊 → 新）
+        "month_labels": [],      # 對應的年/月標籤
+        "latest_yoy": None,
+        "acceleration": None,
+        "status": "⚪ 資料不足",
+        "source": "",
+        "text": "",
+    }
+
+    if code.startswith("00"):  # ETF（00 開頭）無個別公司月營收
+        out["status"] = "⚪ ETF 無月營收資料"
+        out["text"] = "- ETF 無個別公司月營收，營收二階加速度指標不適用。"
+        return out
+
+    # --- 1) FinMind 月營收歷史 ---
+    monthly = {}
+    try:
+        start = (datetime.now() - timedelta(days=430)).strftime("%Y-%m-%d")
+        resp = requests.get(
+            "https://api.finmindtrade.com/api/v4/data",
+            params={
+                "dataset": "TaiwanStockMonthRevenue",
+                "data_id": code,
+                "start_date": start,
+            },
+            timeout=12,
+        )
+        for row in resp.json().get("data", []):
+            year = int(row.get("revenue_year") or 0)
+            month = int(row.get("revenue_month") or 0)
+            revenue = _to_number(row.get("revenue"))
+            if year and month and revenue is not None:
+                monthly[(year, month)] = revenue
+        if monthly:
+            out["source"] = "FinMind 月營收"
+    except Exception:
+        monthly = {}
+
+    # --- 2) 計算近 3 個月 YoY 與二階加速度 ---
+    if monthly:
+        recent = sorted(monthly)[-3:]
+        yoy_values, labels = [], []
+        for year, month in recent:
+            prev = monthly.get((year - 1, month))
+            cur = monthly[(year, month)]
+            if prev:
+                yoy_values.append((cur - prev) / abs(prev) * 100)
+                labels.append(f"{year}/{month:02d}")
+        if yoy_values:
+            out["yoy_list"] = yoy_values
+            out["month_labels"] = labels
+            out["latest_yoy"] = yoy_values[-1]
+            if len(yoy_values) >= 3:
+                t, t1, t2 = yoy_values[-1], yoy_values[-2], yoy_values[-3]
+                out["acceleration"] = t - 2 * t1 + t2
+
+    # --- 3) 備援：TWSE OpenAPI（僅最新單月） ---
+    if out["latest_yoy"] is None:
+        try:
+            resp = requests.get(
+                "https://openapi.twse.com.tw/v1/opendata/t187ap05_L", timeout=15
+            )
+            for row in resp.json():
+                if str(row.get("公司代號", "")) == code:
+                    yoy = _to_number(row.get("營業收入-去年同月增減(%)"))
+                    if yoy is not None:
+                        out["latest_yoy"] = yoy
+                        out["source"] = "TWSE OpenAPI（單月）"
+                    break
+        except Exception:
+            pass
+
+    # --- 4) 判定動能狀態 ---
+    accel, latest = out["acceleration"], out["latest_yoy"]
+    if accel is not None:
+        if latest is not None and latest < 0:
+            out["status"] = "⚠️ 成長減速中"
+        elif accel > 0.5:
+            out["status"] = "🚀 訂單剛爆發 (加速度正向)"
+        elif accel < -0.5:
+            out["status"] = "⚠️ 成長減速中"
+        else:
+            out["status"] = "⚖️ 穩健成長"
+    elif latest is not None:
+        out["status"] = "⚖️ 穩健成長" if latest >= 0 else "⚠️ 成長減速中"
+
+    # --- 5) 組成給 Prompt / 畫面用的摘要文字 ---
+    lines = []
+    if out["month_labels"]:
+        yoy_txt = "、".join(
+            f"{lab} {val:+.1f}%"
+            for lab, val in zip(out["month_labels"], out["yoy_list"])
+        )
+        lines.append(f"- 近 3 個月營收 YoY：{yoy_txt}（{out['source']}）")
+    elif latest is not None:
+        lines.append(
+            f"- 最新單月營收 YoY：{latest:+.1f}%（{out['source']}，僅單月資料）"
+        )
+    else:
+        lines.append("- 月營收資料暫時無法取得（資料源異常或標的無月營收）")
+    if accel is not None:
+        lines.append(
+            f"- 營收二階加速度（YoY_t − 2×YoY_(t-1) + YoY_(t-2)）：{accel:+.2f}"
+        )
+    lines.append(f"- 動能狀態：{out['status']}")
+    out["text"] = "\n".join(lines)
+    return out
+
+
 def _to_number(value):
     """把模型回傳的數值（數字或 '12.5%' 類字串）轉成 float，失敗回傳 None。"""
     if value is None or isinstance(value, bool):
@@ -495,6 +705,8 @@ def _parse_analysis(text: str):
         # 籌碼面（Market Capital Flow）欄位
         "chip_insight": str(data.get("chip_insight", "") or "").strip(),
         "chip_alert": str(data.get("chip_alert", "") or "").strip(),
+        # 供應鏈與營收領先指標（Leading Signal）欄位
+        "leading_outlook": str(data.get("leading_outlook", "") or "").strip(),
     }
 
 
@@ -515,6 +727,12 @@ def analyze_stock_with_gemini(stock_name, stock_symbol, tech_summary: str = ""):
     # 資料備援：呼叫 Gemini 前，先從 yfinance 抓真實財報數據
     fund = fetch_fundamentals(stock_symbol)
 
+    # 領先指標：上游巨頭 CapEx/DOI 與該股月營收二階加速度
+    us_lead = fetch_us_lead_indicators()
+    rev_accel = calculate_revenue_acceleration(stock_symbol)
+    us_lead_text = us_lead.get("text") or "（NVDA/AAPL 領先指標資料暫時無法取得）"
+    rev_accel_text = rev_accel.get("text") or "（月營收領先指標資料暫時無法取得）"
+
     prompt = f"""你是台股資深研究員，擅長基本面、技術面與題材面的綜合判斷。
 請針對下列標的執行「AI 股市三健檢」，並**嚴格只回傳一個 JSON 物件**（不要 markdown、不要任何額外文字）。
 
@@ -525,6 +743,12 @@ def analyze_stock_with_gemini(stock_name, stock_symbol, tech_summary: str = ""):
 【近期網路新聞與法說摘要】
 {news_block}
 
+【上游領先指標（NVDA/AAPL 客觀財報數據，請直接引用）】
+{us_lead_text}
+
+【台廠月營收領先指標（近3月 YoY 與二階加速度）】
+{rev_accel_text}
+
 回傳 JSON 格式（四個區塊都不可省略）：
 {{
   "health_score": 0到100的整數,
@@ -533,6 +757,7 @@ def analyze_stock_with_gemini(stock_name, stock_symbol, tech_summary: str = ""):
   "future_dynamics": "【3. 未來動態性】最新接單情況、訂單能見度、新產品與研發進度，條列，200字內",
   "chip_insight": "【籌碼面洞察】近5~10個交易日三大法人（外資/投信/自營）買賣超動向、千張大戶持股比率與總股東人數變化、籌碼集中或散亂判讀，條列120字內",
   "chip_alert": "若發現籌碼與股價背離（主力暗中建倉：籌碼集中但股價未漲／主力拉高出貨：散戶接盤），填『前瞻籌碼警訊：...』60字內；沒有發現則填空字串 \"\"",
+  "leading_outlook": "前瞻供應鏈領先訊號摘要：結合 NVDA/AAPL 的 CapEx 與庫存天數、以及台廠月營收二階加速度，說明美股客戶拉貨狀況對該台股未來 3-6 個月訂單的實質影響，150字內",
   "surprise_status": "四選一：強烈超預期 🚀 / 符合預期 ⚖️ / 低於預期 ⚠️ / 資料不足 ❓",
   "surprise_rate": 驚喜度百分比數字（公式：（實際-預期）/預期×100，以最新一季 EPS 計算，保留兩位小數；無法計算時填 null）,
   "surprise_is_estimate": true或false（true=預估基準為推估、false=市場法人共識數字）,
@@ -552,7 +777,8 @@ def analyze_stock_with_gemini(stock_name, stock_symbol, tech_summary: str = ""):
 6. 新聞若不足，請明確寫「網路資料有限」，不得把不確定資訊寫成確定事實。
 7. 語氣務實，不得有保證獲利的字眼。
 8. **【籌碼面 (Market Capital Flow)】請主動檢索**：近 5~10 個交易日**三大法人（外資、投信、自營商）的買賣超動向**（例如：外資連續賣超、投信連續買超/逢低布局），以及「**千張大戶持股比率**」與「**總股東人數**」的近期變化，判讀籌碼是趨於集中還是沉澱散亂。
-9. **【籌碼融合與背離警訊】**將上述籌碼動向融入 `buy_timing`（買進時機點）與 `future_dynamics`（未來動態性）的評估中；若發現「**主力暗中建倉（籌碼集中但股價未漲）**」或「**主力逢高拉高出貨（散戶接盤）**」等籌碼與股價背離狀況，必須在 `chip_alert` 填入「前瞻籌碼警訊」加以提示，否則填空字串。"""
+9. **【籌碼融合與背離警訊】**將上述籌碼動向融入 `buy_timing`（買進時機點）與 `future_dynamics`（未來動態性）的評估中；若發現「**主力暗中建倉（籌碼集中但股價未漲）**」或「**主力逢高拉高出貨（散戶接盤）**」等籌碼與股價背離狀況，必須在 `chip_alert` 填入「前瞻籌碼警訊」加以提示，否則填空字串。
+10. **【領先指標】**必須結合上方「NVDA/AAPL CapEx 與庫存天數」與「台廠月營收二階加速度」兩項客觀數據，在 `leading_outlook` 產出 **150 字內**的前瞻供應鏈領先訊號摘要，具體說明美股客戶拉貨狀況對該台股未來 3-6 個月訂單的實質影響；數據若缺失請如實註明，不得虛構。"""
 
     try:
         client = genai.Client(api_key=api_key)
@@ -621,6 +847,12 @@ SAMPLE_ANALYSIS = {
         "• **總股東人數**：單週微增 0.4%，散戶增加有限，整體屬『集中微升、未見過度散亂』。"
     ),
     "chip_alert": "",  # 未見籌碼與股價背離，故不發出警訊
+    # 供應鏈與營收領先指標（靜態範例）
+    "leading_outlook": (
+        "（靜態範例）NVDA 資本支出年增率維持高檔、AAPL 庫存天數回落，顯示美系客戶拉貨轉強；"
+        "該股近 3 月營收 YoY 穩步走高且加速度為正，研判未來 3-6 個月訂單能見度維持樂觀，"
+        "惟仍須留意客戶出貨節奏與庫存去化速度。"
+    ),
 }
 
 
@@ -701,6 +933,76 @@ def render_surprise_block(result: dict) -> None:
         outlook = str(result.get("surprise_outlook", "") or "").strip()
         if outlook:
             st.markdown(f"**🔬 驚喜度對股價的前瞻影響：**  \n{outlook}")
+
+
+def render_leading_block(result: dict, symbol: str, label: str) -> None:
+    """呈現「🔮 供應鏈與營收領先指標」卡片區塊。
+
+    - 上方 st.metric：NVDA/AAPL CapEx 年增率與庫存天數變化（即時運算、快取 6h）
+    - 中段：台股月營收二階加速度狀態與動能燈號
+    - 下方 st.info：Gemini 提煉的未來 3-6 個月訂單前瞻展望
+    """
+    with st.expander("🔮 供應鏈與營收領先指標 (Leading Signal Model)", expanded=True):
+        us = fetch_us_lead_indicators()
+        accel = calculate_revenue_acceleration(symbol)
+
+        # --- 上游巨頭領先指標 ---
+        st.markdown("**🏭 上游巨頭領先指標（NVDA / AAPL 最新財報）**")
+        cols = st.columns(4)
+        for i, name in enumerate(("NVDA", "AAPL")):
+            info = us.get(name) or {}
+            capex = info.get("capex_yoy")
+            doi = info.get("doi")
+            doi_change = info.get("doi_change")
+            cols[2 * i].metric(
+                f"{name} 資本支出年增率",
+                f"{capex:+.1f}%" if capex is not None else "N/A",
+            )
+            cols[2 * i + 1].metric(
+                f"{name} 庫存天數 (DOI)",
+                f"{doi:.1f} 天" if doi is not None else "N/A",
+                delta=f"{doi_change:+.1f} 天 vs 去年同期" if doi_change is not None else None,
+                delta_color="inverse",  # 庫存天數上升為警訊（紅色）
+            )
+
+        # --- 台股營收二階加速度與動能燈號 ---
+        st.markdown(f"**📈 {label} 營收二階加速度（月營收動能）**")
+        yoy_list = accel.get("yoy_list") or []
+        acceleration = accel.get("acceleration")
+        status = accel.get("status", "⚪ 資料不足")
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric(
+            "近 3 月營收 YoY",
+            " → ".join(f"{v:+.1f}%" for v in yoy_list[-3:]) if yoy_list else "N/A",
+        )
+        col2.metric(
+            "營收二階加速度",
+            f"{acceleration:+.2f}" if acceleration is not None else "N/A",
+        )
+        if status.startswith("🚀"):
+            light = "🟢"
+        elif status.startswith("⚖️"):
+            light = "🟡"
+        elif status.startswith("⚠️"):
+            light = "🔴"
+        else:
+            light = "⚪"
+        col3.metric("動能燈號", f"{light} {status}")
+
+        if accel.get("source"):
+            st.caption(f"📡 營收資料來源：{accel['source']}")
+
+        # --- Gemini 提煉的前瞻展望 ---
+        outlook = str(result.get("leading_outlook", "") or "").strip()
+        st.info(
+            "**🔮 未來 3-6 個月訂單前瞻展望：**  \n"
+            + (
+                outlook
+                if outlook
+                else "（尚未執行 AI 分析，點擊上方按鈕即可取得 Gemini 提煉的領先訊號摘要）"
+            )
+        )
 
 
 if not selected_labels:
@@ -938,6 +1240,7 @@ else:
             st.caption(f"📊 以下為 **{focus_label_ai}** 最近一次的 AI 即時分析結果：")
             render_analysis_cards(saved_result)
             render_surprise_block(saved_result)
+            render_leading_block(saved_result, focus_sym_ai, focus_label_ai)
         else:
             st.info(
                 "👆 尚未對此標的執行分析，以下先顯示 **靜態範例（中華電 2412）**；"
@@ -945,6 +1248,7 @@ else:
             )
             render_analysis_cards(SAMPLE_ANALYSIS)
             render_surprise_block(SAMPLE_ANALYSIS)
+            render_leading_block(SAMPLE_ANALYSIS, focus_sym_ai, focus_label_ai)
 
         # 底部警示與來源說明
         st.caption(
