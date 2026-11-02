@@ -1,8 +1,31 @@
+import json
+import re
+from urllib.parse import quote
+
 import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 import pandas as pd
+import requests
 from datetime import datetime, timedelta
+
+# Google Gemini SDK（未安裝時不中斷程式，於分析頁提示安裝）
+try:
+    from google import genai
+    from google.genai import types as genai_types
+    GENAI_AVAILABLE = True
+except Exception:
+    genai = None
+    genai_types = None
+    GENAI_AVAILABLE = False
+
+# feedparser 為可選套件，未安裝時改用 requests 解析 Google News RSS
+try:
+    import feedparser
+    FEEDPARSER_AVAILABLE = True
+except Exception:
+    feedparser = None
+    FEEDPARSER_AVAILABLE = False
 
 # 1. 頁面配置
 st.set_page_config(
@@ -169,6 +192,200 @@ def get_symbol_frame(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     return df[required].dropna(how="all")
 
 
+# ---------------------------------------------------------
+# AI 分析模組（Gemini）：金鑰、新聞抓取、三健檢分析
+# ---------------------------------------------------------
+GEMINI_MODEL = "gemini-2.5-flash"
+
+
+def get_gemini_api_key() -> str:
+    """從 Streamlit secrets 讀取 GEMINI_API_KEY，未設定回傳空字串。"""
+    try:
+        return str(st.secrets["GEMINI_API_KEY"]).strip()
+    except Exception:
+        return ""
+
+
+def fetch_recent_news(stock_name: str, stock_symbol: str, max_items: int = 6) -> str:
+    """以 feedparser（或 requests 備援）抓取該標的近期新聞標題，失敗回傳空字串。"""
+    code = stock_symbol.split(".")[0]
+    query = quote(f"{stock_name} {code} 台股")
+    url = (
+        f"https://news.google.com/rss/search?q={query}"
+        "&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+    )
+    titles = []
+    try:
+        if FEEDPARSER_AVAILABLE:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:max_items]:
+                published = entry.get("published", "")
+                titles.append(f"- {entry.get('title', '')}（{published}）")
+        else:
+            resp = requests.get(
+                url, timeout=8, headers={"User-Agent": "Mozilla/5.0"}
+            )
+            resp.raise_for_status()
+            found = re.findall(r"<title>(.*?)</title>", resp.text, flags=re.S)
+            for raw in found[1:max_items + 1]:
+                titles.append(f"- {raw.strip()}")
+    except Exception:
+        return ""
+    return "\n".join(titles)
+
+
+def _build_tech_summary(df: pd.DataFrame) -> str:
+    """組出最新股價與 20MA/60MA 位階描述，供 Prompt 使用。"""
+    if df is None or df.empty:
+        return "（無技術面資料）"
+    close = df["Close"].dropna()
+    if len(close) < 2:
+        return "（資料不足，無法計算均線）"
+
+    price = float(close.iloc[-1])
+    ma20 = float(close.tail(20).mean()) if len(close) >= 20 else None
+    ma60 = float(close.tail(60).mean()) if len(close) >= 60 else None
+
+    def _pos(ma, name):
+        if ma is None:
+            return f"{name}：資料期間不足以計算"
+        diff = (price - ma) / ma * 100
+        where = "上方" if price > ma else "下方"
+        return f"{name}={ma:.2f} 元（股價在其{where} {abs(diff):.2f}%）"
+
+    parts = [
+        f"最新收盤價 {price:.2f} 元",
+        _pos(ma20, "20MA（月線）"),
+        _pos(ma60, "60MA（季線）"),
+    ]
+    if ma20 is not None and ma60 is not None:
+        parts.append(
+            "均線型態：短均在長均之上（多頭排列）"
+            if ma20 > ma60
+            else "均線型態：短均在長均之下（空頭排列）"
+        )
+    return "；".join(parts) + "。"
+
+
+def _parse_analysis(text: str):
+    """解析 Gemini 回傳的 JSON（容忍 markdown code fence 與雜訊）。"""
+    if not text:
+        return None
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.S).strip()
+
+    data = None
+    try:
+        data = json.loads(cleaned)
+    except Exception:
+        start, end = cleaned.find("{"), cleaned.rfind("}")
+        if start != -1 and end > start:
+            try:
+                data = json.loads(cleaned[start:end + 1])
+            except Exception:
+                data = None
+
+    if not isinstance(data, dict):
+        return None
+
+    health = str(data.get("company_health", "")).strip()
+    timing = str(data.get("buy_timing", "")).strip()
+    future = str(data.get("future_dynamics", "")).strip()
+    if not (health or timing or future):
+        return None
+
+    try:
+        score = int(round(float(data.get("health_score", 0))))
+    except Exception:
+        score = 0
+
+    return {
+        "health_score": max(0, min(100, score)),
+        "company_health": health or "（模型未回傳）",
+        "buy_timing": timing or "（模型未回傳）",
+        "future_dynamics": future or "（模型未回傳）",
+    }
+
+
+def analyze_stock_with_gemini(stock_name, stock_symbol, tech_summary: str = ""):
+    """抓新聞 + 組 Prompt → 送 Gemini (gemini-2.5-flash)，回傳三健檢 dict；失敗回傳 None。"""
+    api_key = get_gemini_api_key()
+    if not GENAI_AVAILABLE or not api_key:
+        return None
+
+    news_block = fetch_recent_news(stock_name, stock_symbol)
+    if not news_block:
+        news_block = "（暫無近期網路新聞，請依技術面資料判斷，並註明資料有限）"
+
+    prompt = f"""你是台股資深研究員，擅長基本面、技術面與題材面的綜合判斷。
+請針對下列標的執行「AI 股市三健檢」，並**嚴格只回傳一個 JSON 物件**（不要 markdown、不要任何額外文字）。
+
+【標的】{stock_name}（{stock_symbol}）
+【技術面數據】{tech_summary if tech_summary else "（未提供）"}
+【近期網路新聞與法說摘要】
+{news_block}
+
+回傳 JSON 格式（四個欄位都不可省略）：
+{{
+  "health_score": 0到100的整數,
+  "company_health": "【1. 公司健康度】評分理由、基本面護城河與主要風險，條列白話，200字內",
+  "buy_timing": "【2. 買進時機點】結合當前股價與 20MA/60MA 位階，給明確的進場/觀望策略與停損思考，白話，200字內",
+  "future_dynamics": "【3. 未來動態性】最新接單情況、訂單能見度、新產品與研發進度，條列，200字內"
+}}
+
+要求：
+1. 三個核心指標必須涵蓋，缺一不可。
+2. 新聞若不足，請明確寫「網路資料有限」，不得把不確定資訊寫成確定事實。
+3. 語氣務實，不得有保證獲利的字眼。"""
+
+    try:
+        client = genai.Client(api_key=api_key)
+        try:
+            resp = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    response_mime_type="application/json"
+                ),
+            )
+        except Exception:
+            resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+        return _parse_analysis(resp.text)
+    except Exception:
+        return None
+
+
+# 尚未執行即時分析時顯示的靜態範例（中華電 2412）
+SAMPLE_ANALYSIS = {
+    "health_score": 86,
+    "company_health": (
+        "（靜態範例，非即時資料）\n"
+        "• **評分理由**：國內電信龍頭，行動與寬頻市佔率領先，現金流與股利發放長期穩定。\n"
+        "• **護城河**：網路基建規模、品牌信賴與高轉換成本，屬典型防禦型標的。\n"
+        "• **主要風險**：5G 資本支出壓力、ARPU 成長有限，高股息特性也限制上檔空間。"
+    ),
+    "buy_timing": (
+        "（靜態範例）\n"
+        "• 股價守穩 20MA 之上且 60MA 走平，視為低檔築底完成的觀察區。\n"
+        "• 回測 20MA 不破可分批布局、跌至年線附近再加碼；有效跌破 60MA 且量放大則退場觀望。\n"
+        "• 適合長期持有領息，不宜期待短線價差。"
+    ),
+    "future_dynamics": (
+        "（靜態範例）\n"
+        "• **接單/能見度**：電信服務採合約制，能見度穩定但成長平緩。\n"
+        "• **新產品**：企業雲、資安與 IoT 服務為新動能。\n"
+        "• **研發進度**：持續投入 5G 與光纖覆蓋擴充，資本支出維持穩定水準。"
+    ),
+}
+
+
+def render_analysis_cards(result: dict) -> None:
+    """將三健檢結果渲染為 info / warning / success 三張卡片。"""
+    score = result.get("health_score", 0)
+    st.info(f"**🏥 【1. 公司健康度】**　評分 **{score}/100**  \n{result['company_health']}")
+    st.warning(f"**⏱️ 【2. 買進時機點】**  \n{result['buy_timing']}")
+    st.success(f"**🚀 【3. 未來動態性】**  \n{result['future_dynamics']}")
+
+
 if not selected_labels:
     st.warning("👈 請於左側邊欄選擇至少一檔股票或 ETF 開始載入數據。")
 else:
@@ -198,184 +415,6 @@ else:
         sym = STOCK_DICT[label]
         frames[label] = get_symbol_frame(data_raw, sym)
 
-    # ---------------------------------------------------------
-    # 產業與接單動態：模擬情報資料（展示用，非真實資料）
-    # ---------------------------------------------------------
-    INDUSTRY_MOCK = {
-        "2330.TW": {
-            "order": (
-                "- **客戶投片量**：AI 加速器客戶 4Q26 投片量月增約 6~8%，N3/N2 產能利用率維持 95% 以上；"
-                "智慧型手機客戶投片較前季持平。\n"
-                "- **訂單排程**：CoWoS-L 先進封裝 12 月排程已滿，月產能再增約 8%；12 吋先進製程投片排至 2027/01。\n"
-                "- **能見度摘要**：先進製程訂單能見度看到 **2027 上半年**；成熟製程能見度約 2~3 季，"
-                "車用客戶仍積極去化庫存。"
-            ),
-            "rd": (
-                "- **新產品開發**：N2 GAA 良率爬坡順利、按計畫 2H26 量產；N1.6 進入 risk production。\n"
-                "- **認證進度**：N2 客戶產品已完成可靠性認證 3/4 家；CoWoS-L 通過大客戶系統級驗證。\n"
-                "- **建廠量產時程**：寶山與高雄新產線 1Q27 設備驗證；熊本二廠 2027 量產；美國二廠預計 2028 量產。"
-            ),
-            "news": [
-                {"date": "2026/10/30", "source": "法人研報", "title": "外資上調目標價，重申「加碼」評等",
-                 "summary": "看好 2nm 2027 年貢獻營收雙位數成長，AI 相關營收占比將逾 20%。"},
-                {"date": "2026/10/27", "source": "新聞", "title": "法說會釋出 4Q26 展望：美元營收季增個位數",
-                 "summary": "毛利率維持 57~59%，先進製程與先進封裝為成長雙引擎。"},
-                {"date": "2026/10/23", "source": "法人研報", "title": "CoWoS 產能調查：2027 年供給缺口收斂",
-                 "summary": "券商預估 2027 年產能年增 6~8 成，惟需求仍集中於少數 AI 客戶。"},
-            ],
-        },
-        "2317.TW": {
-            "order": (
-                "- **客戶投片量**：AI 伺服器機櫃 4Q26 出貨量月增約 10%，GB 系列客戶加單明確；"
-                "消費電子零組件投片維持正常水準。\n"
-                "- **訂單排程**：越南新產線 12 月試產、墨西哥廠擴建工程 1H27 完成；電動車新車 1Q27 開始拉貨。\n"
-                "- **能見度摘要**：AI 伺服器訂單能見度看到 **2027 上半年**；傳統消費電子能見度約 1 季。"
-            ),
-            "rd": (
-                "- **新產品開發**：新一代 AI 機櫃設計定案、液冷方案導入客戶驗證中；EV 平台新車款 1Q27 試量產。\n"
-                "- **認證進度**：車用 ISO 26262 功能安全認證通過；部分醫療產品進入法規送審。\n"
-                "- **建廠量產時程**：越南、墨西哥、泰國三地新廠依期推進，2027 年上半年陸續量產。"
-            ),
-            "news": [
-                {"date": "2026/10/29", "source": "法人研報", "title": "AI 機櫃出貨放量，4Q 營運季增高個位數",
-                 "summary": "券商上調 2027 年 EPS 預估，看好 AI 伺服器營收占比突破 25%。"},
-                {"date": "2026/10/25", "source": "新聞", "title": "電動車品牌公布新車時程，年底啟動預售",
-                 "summary": "法人關注量產初期毛利率與認列時點，短期對獲利貢獻有限。"},
-                {"date": "2026/10/20", "source": "新聞", "title": "墨西哥廠擴建，因應客戶北美供應鏈需求",
-                 "summary": "規劃新增組裝產線與倉儲，預計 2027 上半年完工。"},
-            ],
-        },
-        "2454.TW": {
-            "order": (
-                "- **客戶投片量**：旗艦手機 SoC 客戶 4Q26 投片量季增約 5%，中高階晶片需求回溫；"
-                "邊緣 AI 與車用晶片投片穩步成長。\n"
-                "- **訂單排程**：3nm 旗艦平台 12 月投片排滿；NRE 專案排程已排至 2027 年 1 季。\n"
-                "- **能見度摘要**：旗艦與邊緣 AI 產品能見度 **2~3 季**；IoT 與消費性晶片能見度約 1~2 季。"
-            ),
-            "rd": (
-                "- **新產品開發**：新一代旗艦 SoC 進入 Design In、邊緣運算 AI 平台 2H27 推出。\n"
-                "- **認證進度**：車用晶片通過部分車廠設計驗證；Wi-Fi 7 產品量產認證完成。\n"
-                "- **建廠量產時程**：與代工夥伴 3nm 產能合作延續至 2027 年，無自建廠計畫（以 Fabless 為主）。"
-            ),
-            "news": [
-                {"date": "2026/10/31", "source": "法人研報", "title": "旗艦平台導入率優於預期，維持「增持」",
-                 "summary": "券商看好 2027 年 AI 手機滲透率提升帶來的 ASP 上揚。"},
-                {"date": "2026/10/26", "source": "新聞", "title": "發表新一代邊緣 AI 平台，攜手雲端夥伴",
-                 "summary": "強調端側推論效能與功耗優化，鎖定智慧裝置與機器人應用。"},
-                {"date": "2026/10/21", "source": "法人研報", "title": "IoT 客戶庫存調整近尾聲",
-                 "summary": "調查顯示部分客戶 4Q26 回補庫存，出貨可望於 1Q27 回溫。"},
-            ],
-        },
-        "0050.TW": {
-            "order": (
-                "- **成分股獲利能見度**：前十大成分股 4Q26 獲利預估年增約 12%，以半導體與 AI 供應鏈為主幹。\n"
-                "- **資金流與申購排程**：近 4 週淨申購維持正成長；成分股除息與權重調整於 9/12、12/12 生效。\n"
-                "- **能見度摘要**：整體成分股營收能見度約 **1~2 季**，指數走勢與全球科技股情緒高度連動。"
-            ),
-            "rd": (
-                "- **追蹤優化**：年中成分股審核完成，市值涵蓋率維持 70% 以上，追蹤誤差低於 0.5%。\n"
-                "- **產品進度**：定期調整前十大權重，降低單一個股集中度風險。\n"
-                "- **費用與規模**：基金規模穩健成長，經理費率維持低廉水準。"
-            ),
-            "news": [
-                {"date": "2026/10/30", "source": "法人研報", "title": "台股權值行情延續，建議定期定額布局",
-                 "summary": "法人認為 AI 供應鏈獲利成長仍實質支撐指數表現。"},
-                {"date": "2026/10/24", "source": "新聞", "title": "ETF 權重調整名單公布，成分股無重大變動",
-                 "summary": "本次審核維持原有成分結構，資金流向以內資定期定額為主。"},
-            ],
-        },
-        "00878.TW": {
-            "order": (
-                "- **成分股配息能見度**：成分股 3Q26 配息陸續公布，年化配息率維持約 5~6% 區間。\n"
-                "- **資金流與除息排程**：月配息機制於每月初除息，近期申購量回升。\n"
-                "- **能見度摘要**：高股息成分股獲利能見度約 **1~2 季**，受惠 AI 與傳產雙輪動。"
-            ),
-            "rd": (
-                "- **追蹤調整**：ESG 過濾條件維持嚴格，成分股汰換率低於 15%。\n"
-                "- **產品進度**：受益人數持續增加，規模穩居高股息 ETF 前段班。\n"
-                "- **風險控管**：單一產業上限設定，降低電子權重過度集中。"
-            ),
-            "news": [
-                {"date": "2026/10/28", "source": "新聞", "title": "月配息金額公布，填息表現穩健",
-                 "summary": "近期除息後 5 個交易日內完成填息，維持穩定現金流特性。"},
-                {"date": "2026/10/19", "source": "法人研報", "title": "高股息資金動能回溫，散戶定期定額加碼",
-                 "summary": "法人觀察內資對防禦型標的配置比重上升。"},
-            ],
-        },
-        "00919.TW": {
-            "order": (
-                "- **成分股獲利能見度**：成分股以航運、金融與電子為主，4Q26 獲利能見度約 1~2 季。\n"
-                "- **資金流與除息排程**：季配息機制，12 月除息前預期有資金卡位。\n"
-                "- **能見度摘要**：高息成分股殖利率支撐明顯，但需留意產業循環波動。"
-            ),
-            "rd": (
-                "- **追蹤調整**：精選高息篩選邏輯維持，前十大權重集中度偏高需留意。\n"
-                "- **產品進度**：配息紀錄延續，受益人數維持高檔。\n"
-                "- **風險控管**：航運與鋼鐵族群占比高，景氣反轉時波動較大。"
-            ),
-            "news": [
-                {"date": "2026/10/27", "source": "新聞", "title": "宣布配息金額，年化殖利率約 5%",
-                 "summary": "除息日訂於 12 月初，投信提醒留意短期殖利率題材反應。"},
-                {"date": "2026/10/18", "source": "法人研報", "title": "航運族群旺季後獲利趨緩，留意權重影響",
-                 "summary": "建議投資人關注成分股產業集中度帶來的波動。"},
-            ],
-        },
-        "00929.TW": {
-            "order": (
-                "- **成分股獲利能見度**：科技高息成分股 4Q26 獲利年增約 8%，AI 供應鏈為主要貢獻。\n"
-                "- **資金流與除息排程**：月配息機制，近期申購與贖回趨於平衡。\n"
-                "- **能見度摘要**：成分股獲利能見度約 **1~2 季**，配息來源以資本利得與股利並行。"
-            ),
-            "rd": (
-                "- **追蹤調整**：科技主題篩選維持，電子股占比逾七成。\n"
-                "- **產品進度**：月配息穩定，受益人數居月配息 ETF 前列。\n"
-                "- **風險控管**：科技股集中度高，市場修正時淨值波動較大。"
-            ),
-            "news": [
-                {"date": "2026/10/29", "source": "新聞", "title": "月配息金額持平，年化殖利率約 6%",
-                 "summary": "投信表示配息主要來自股利與已實現資本利得，財務體質正常。"},
-                {"date": "2026/10/17", "source": "法人研報", "title": "科技股波動加大，建議以分批布局取代單筆",
-                 "summary": "法人提醒月配息不等於保證報酬，仍須關注成分股估值。"},
-            ],
-        },
-    }
-
-    def _fallback_brief(label: str, symbol: str) -> dict:
-        """使用者自行新增、無預設模擬資料的標的，產生通用版模擬摘要。"""
-        code = symbol.split(".")[0]
-        if code.startswith("00"):  # ETF
-            return {
-                "order": (
-                    f"- **成分股獲利能見度**：（模擬）{label} 成分股整體營收能見度約 1~2 季。\n"
-                    "- **資金流與排程**：（模擬）近期申購/贖回量平穩，除息排程依基金公告為準。\n"
-                    "- **能見度摘要**：（模擬）指數型商品走勢與大盤連動，殖利率題材支撐評價。"
-                ),
-                "rd": (
-                    "- **追蹤調整**：（模擬）成分股審核依指數規則定期進行。\n"
-                    "- **產品進度**：（模擬）基金規模與受益人數穩定成長。\n"
-                    "- **風險控管**：（模擬）留意產業集中度與市場系統性風險。"
-                ),
-                "news": [
-                    {"date": "2026/10/26", "source": "新聞", "title": f"{label} 近期資金動能觀察（模擬）",
-                     "summary": "（模擬數據）內資定期定額買盤為主要支撐，短線籌碼穩定。"},
-                ],
-            }
-        return {
-            "order": (
-                f"- **客戶投片量**：（模擬）{label} 近期主要客戶投片量月增約 3~5%。\n"
-                "- **訂單排程**：（模擬）產線排程已排至下季初，急單比例小幅上升。\n"
-                "- **能見度摘要**：（模擬）訂單能見度約 **2 季**，需持續觀察終端需求。"
-            ),
-            "rd": (
-                f"- **新產品開發**：（模擬）{label} 新產品進入客戶驗證階段。\n"
-                "- **認證進度**：（模擬）主要產品認證進度符合預期。\n"
-                "- **建廠量產時程**：（模擬）產能擴建依計畫推進，預計明年上半年量產。"
-            ),
-            "news": [
-                {"date": "2026/10/26", "source": "法人研報", "title": f"{label} 近況追蹤（模擬）",
-                 "summary": "（模擬數據）券商評等與目標價僅供展示，非真實研究報告。"},
-            ],
-        }
 
     # 主畫面 5 大分頁
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -383,7 +422,7 @@ else:
         "📈 K線與技術分析",
         "⚖️ 多標的走勢對比",
         "📋 歷史數據明細",
-        "📰 產業與接單動態",
+        "🤖 AI 股市三健檢與動態分析",
     ])
 
     # -----------------------------------------------------
@@ -519,41 +558,71 @@ else:
             )
 
     # -----------------------------------------------------
-    # Tab 5: 產業與接單動態 (Industry & Order Dynamics)
+    # Tab 5: AI 股市三健檢與動態分析 (Gemini)
     # -----------------------------------------------------
     with tab5:
-        st.subheader("📰 產業與接單動態")
-        focus_label_news = st.selectbox(
-            "選擇要調閱情報的自選股標的：",
+        st.subheader("🤖 AI 股市三健檢與動態分析")
+
+        if "ai_results" not in st.session_state:
+            st.session_state["ai_results"] = {}
+
+        api_key = get_gemini_api_key()
+        ai_ready = GENAI_AVAILABLE and bool(api_key)
+
+        # 頂部：股票選擇框
+        focus_label_ai = st.selectbox(
+            "選擇要分析的自選股標的：",
             selected_labels,
-            key="news_select",
+            key="ai_select",
         )
-        focus_sym_news = STOCK_DICT[focus_label_news]
-        brief = INDUSTRY_MOCK.get(focus_sym_news) or _fallback_brief(focus_label_news, focus_sym_news)
+        focus_sym_ai = STOCK_DICT[focus_label_ai]
 
-        # 左右雙欄：訂單能見度 / 研發進度
-        col_order, col_rd = st.columns(2)
+        # 環境檢查提示
+        if not GENAI_AVAILABLE:
+            st.warning("⚠️ 未安裝 google-genai 套件，請先執行：`pip install google-genai`")
+        elif not api_key:
+            st.warning(
+                "⚠️ 未設定 GEMINI_API_KEY，請在 `.streamlit/secrets.toml` 加入："
+                "`GEMINI_API_KEY = \"你的金鑰\"`"
+            )
 
-        with col_order:
-            st.info(f"**【📦 訂單能見度與接單狀況】**  \n{brief['order']}")
+        # 分析按鈕
+        run_clicked = st.button(
+            "🚀 開始 AI 健檢與情報分析",
+            type="primary",
+            use_container_width=True,
+            disabled=not ai_ready,
+        )
 
-        with col_rd:
-            st.success(f"**【🔬 研發與新技術進度】**  \n{brief['rd']}")
-
-        # 近期法人研報與新聞提煉明細
-        with st.expander("📄 近期的法人研報與新聞提煉明細"):
-            for item in brief["news"]:
-                st.markdown(
-                    f"**🗓️ {item['date']}｜{item['source']}｜{item['title']}**"
+        if run_clicked:
+            with st.spinner("AI 正在檢索最新網路資料與分析中..."):
+                tech_summary = _build_tech_summary(frames.get(focus_label_ai))
+                ai_result = analyze_stock_with_gemini(
+                    focus_label_ai, focus_sym_ai, tech_summary
                 )
-                st.write(item["summary"])
-                st.divider()
+            if ai_result is None:
+                st.error("❌ AI 分析失敗，請確認 API Key、網路連線與套件版本後再試一次。")
+            else:
+                # 結果存入 session_state，切換分頁或元件後不會遺失
+                st.session_state["ai_results"][focus_label_ai] = ai_result
+
+        st.divider()
+
+        saved_result = st.session_state["ai_results"].get(focus_label_ai)
+        if saved_result:
+            st.caption(f"📊 以下為 **{focus_label_ai}** 最近一次的 AI 即時分析結果：")
+            render_analysis_cards(saved_result)
+        else:
+            st.info(
+                "👆 尚未對此標的執行分析，以下先顯示 **靜態範例（中華電 2412）**；"
+                "點擊上方「🚀 開始 AI 健檢與情報分析」即可取得即時結果。"
+            )
+            render_analysis_cards(SAMPLE_ANALYSIS)
 
         # 底部警示與來源說明
         st.caption(
-            "⚠️ 警示：本分頁所有內容皆為**模擬展示資料**，僅用於介面功能示範，"
-            "不代表真實訂單、研發進度或法人意見，亦不構成任何投資建議；"
-            "實際投資決策請自行查證並自負風險。\n\n"
-            "📎 資料來源（模擬假設）：公開資訊觀測站、公司法說會/重大訊息、券商研究報告、"
-            "產業新聞等公開管道；正式版本應接上上述來源之即時資料。"
+            "⚠️ 警示：AI 產出內容（含靜態範例）由語言模型生成，可能有誤、過時或遺漏，"
+            "僅供研究參考，不構成任何投資建議；投資決策請自行查證並自負風險。\n\n"
+            "📎 資料來源：Google News RSS 近期新聞標題、本機行情計算之 20MA/60MA 均線位階，"
+            f"並由 {GEMINI_MODEL} 綜合研判。"
         )
