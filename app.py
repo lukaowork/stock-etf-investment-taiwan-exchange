@@ -307,7 +307,11 @@ def _parse_analysis(text: str):
 
 
 def analyze_stock_with_gemini(stock_name, stock_symbol, tech_summary: str = ""):
-    """抓新聞 + 組 Prompt → 送 Gemini (gemini-2.5-flash)，回傳三健檢 dict；失敗回傳 None。"""
+    """抓新聞 + 組 Prompt → 送 Gemini (gemini-2.5-flash)，回傳三健檢 dict。
+
+    失敗時丟出例外，由呼叫端捕捉並顯示詳細錯誤訊息；
+    僅在未安裝套件或未設定金鑰時回傳 None。
+    """
     api_key = get_gemini_api_key()
     if not GENAI_AVAILABLE or not api_key:
         return None
@@ -348,10 +352,18 @@ def analyze_stock_with_gemini(stock_name, stock_symbol, tech_summary: str = ""):
                 ),
             )
         except Exception:
+            # 舊版 SDK 不支援 response_mime_type 時，改用一般呼叫重試
             resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-        return _parse_analysis(resp.text)
+        parsed = _parse_analysis(resp.text)
+        if parsed is None:
+            raise ValueError(
+                "模型回傳內容無法解析為 JSON，原始回應前 200 字："
+                f"{str(resp.text)[:200]}"
+            )
+        return parsed
     except Exception:
-        return None
+        # 不吞掉錯誤：交由呼叫端捕捉，並在畫面上顯示完整錯誤訊息
+        raise
 
 
 # 尚未執行即時分析時顯示的靜態範例（中華電 2412）
@@ -595,16 +607,24 @@ else:
         )
 
         if run_clicked:
-            with st.spinner("AI 正在檢索最新網路資料與分析中..."):
-                tech_summary = _build_tech_summary(frames.get(focus_label_ai))
-                ai_result = analyze_stock_with_gemini(
-                    focus_label_ai, focus_sym_ai, tech_summary
-                )
-            if ai_result is None:
-                st.error("❌ AI 分析失敗，請確認 API Key、網路連線與套件版本後再試一次。")
+            tech_summary = _build_tech_summary(frames.get(focus_label_ai))
+            try:
+                with st.spinner("AI 正在檢索最新網路資料與分析中..."):
+                    ai_result = analyze_stock_with_gemini(
+                        focus_label_ai, focus_sym_ai, tech_summary
+                    )
+            except Exception as e:
+                # 除錯用：印出真正的錯誤資訊
+                st.error(f"❌ AI 分析失敗，詳細錯誤訊息：{str(e)}")
             else:
-                # 結果存入 session_state，切換分頁或元件後不會遺失
-                st.session_state["ai_results"][focus_label_ai] = ai_result
+                if ai_result is None:
+                    st.error(
+                        "❌ AI 分析失敗：未設定 GEMINI_API_KEY，"
+                        "或模型未回傳可解析的結果。"
+                    )
+                else:
+                    # 結果存入 session_state，切換分頁或元件後不會遺失
+                    st.session_state["ai_results"][focus_label_ai] = ai_result
 
         st.divider()
 
