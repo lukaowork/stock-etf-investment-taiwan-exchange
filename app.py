@@ -195,7 +195,7 @@ def get_symbol_frame(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
 # ---------------------------------------------------------
 # AI 分析模組（Gemini）：金鑰、新聞抓取、三健檢分析
 # ---------------------------------------------------------
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.8-flash"
 
 
 def get_gemini_api_key() -> str:
@@ -307,7 +307,7 @@ def _parse_analysis(text: str):
 
 
 def analyze_stock_with_gemini(stock_name, stock_symbol, tech_summary: str = ""):
-    """抓新聞 + 組 Prompt → 送 Gemini (gemini-2.5-flash)，回傳三健檢 dict。
+    """抓新聞 + 組 Prompt → 送 Gemini (gemini-3.8-flash)，回傳三健檢 dict。
 
     失敗時丟出例外，由呼叫端捕捉並顯示詳細錯誤訊息；
     僅在未安裝套件或未設定金鑰時回傳 None。
