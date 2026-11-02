@@ -267,6 +267,174 @@ def _build_tech_summary(df: pd.DataFrame) -> str:
     return "；".join(parts) + "。"
 
 
+def _fmt_revenue(value: float) -> str:
+    """把營收數字格式化成台股習慣的『億』單位字串。"""
+    return f"{value / 1e8:,.1f} 億"
+
+
+def _status_from_rate(rate: float) -> str:
+    """依驚喜度百分比回傳狀態標籤。"""
+    if rate > 5:
+        return "強烈超預期 🚀"
+    if rate < -5:
+        return "低於預期 ⚠️"
+    return "符合預期 ⚖️"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_fundamentals(symbol: str) -> dict:
+    """yfinance 財務數據備援：在呼叫 Gemini 前先抓最新一季 EPS/營收與法人預估。
+
+    依序嘗試 ticker.earnings_history、ticker.earnings_dates、
+    ticker.quarterly_income_stmt，回傳：
+      - text          ：可直接放進 Prompt 的數據摘要（空字串代表沒抓到）
+      - eps_estimate  ：法人預估 EPS（有才覆蓋模型結果）
+      - eps_actual    ：實際 EPS（yfinance 實數）
+      - revenue_actual：實際營收（yfinance 實數）
+      - avg_eps_4q    ：近 4 季平均 EPS（供模型推估基準）
+      - revenue_yoy   ：最近一季營收年增率 YoY %
+    """
+    data = {
+        "text": "",
+        "eps_estimate": None,
+        "eps_actual": None,
+        "revenue_estimate": None,
+        "revenue_actual": None,
+        "avg_eps_4q": None,
+        "revenue_yoy": None,
+    }
+
+    try:
+        ticker = yf.Ticker(symbol)
+    except Exception:
+        return data
+
+    # --- A. earnings_history：dict 結構的法人預估 vs 實際（防禦式解析） ---
+    try:
+        history = ticker.earnings_history
+        if isinstance(history, dict):
+            for outer_key, group in history.items():
+                key = str(outer_key).lower()
+                if not isinstance(group, dict):
+                    continue
+                for info in group.values():
+                    if not isinstance(info, dict):
+                        continue
+                    # EPS：epsEstimate / epsActual
+                    if data["eps_actual"] is None and (
+                        "eps" in key or "earning" in key or "epsActual" in info
+                    ):
+                        actual = _to_number(info.get("epsActual"))
+                        if actual is not None:
+                            data["eps_actual"] = actual
+                            data["eps_estimate"] = _to_number(info.get("epsEstimate"))
+                    # 營收：revenueEstimate / revenueActual
+                    if data["revenue_actual"] is None and (
+                        "revenue" in key or "revenueActual" in info
+                    ):
+                        actual = _to_number(info.get("revenueActual"))
+                        if actual is not None:
+                            data["revenue_actual"] = actual
+                            data["revenue_estimate"] = _to_number(
+                                info.get("revenueEstimate")
+                            )
+    except Exception:
+        pass
+
+    # --- B. earnings_dates：表格形式的預估 vs 實際 ---
+    try:
+        dates = ticker.earnings_dates
+        if dates is not None and hasattr(dates, "empty") and not dates.empty:
+            colmap = {str(c).lower(): c for c in dates.columns}
+            actual_col = colmap.get("reported eps")
+            estimate_col = colmap.get("eps estimate")
+            if actual_col is not None:
+                done = dates.dropna(subset=[actual_col]).sort_index()
+                if not done.empty and data["eps_actual"] is None:
+                    last_row = done.iloc[-1]
+                    data["eps_actual"] = _to_number(last_row[actual_col])
+                    if estimate_col is not None:
+                        data["eps_estimate"] = _to_number(last_row[estimate_col])
+    except Exception:
+        pass
+
+    # --- C. quarterly_income_stmt：台股主要來源（實際營收/EPS、近4季平均、YoY） ---
+    try:
+        stmt = ticker.quarterly_income_stmt
+        if stmt is not None and hasattr(stmt, "empty") and not stmt.empty:
+            idx = {str(i).lower(): i for i in stmt.index}
+
+            rev_row = idx.get("total revenue")
+            if rev_row is not None:
+                rev_series = stmt.loc[rev_row].dropna()
+                if data["revenue_actual"] is None and not rev_series.empty:
+                    data["revenue_actual"] = _to_number(rev_series.iloc[0])
+                # 同一季 vs 去年同季（第 5 欄）→ 營收年增率 YoY
+                if len(rev_series) >= 5:
+                    last_val = _to_number(rev_series.iloc[0])
+                    year_ago = _to_number(rev_series.iloc[4])
+                    if last_val is not None and year_ago not in (None, 0):
+                        data["revenue_yoy"] = (last_val - year_ago) / abs(year_ago) * 100
+
+            eps_row = idx.get("diluted eps") or idx.get("basic eps")
+            if eps_row is not None:
+                eps_series = stmt.loc[eps_row].dropna()
+                if data["eps_actual"] is None and not eps_series.empty:
+                    data["eps_actual"] = _to_number(eps_series.iloc[0])
+                if len(eps_series) >= 4:
+                    data["avg_eps_4q"] = float(eps_series.iloc[:4].mean())
+    except Exception:
+        pass
+
+    # --- 組成放入 Prompt 的文字摘要 ---
+    lines = []
+    if data["eps_actual"] is not None:
+        line = f"- 最新一季實際 EPS：{data['eps_actual']:.2f} 元"
+        if data["eps_estimate"]:
+            rate = (data["eps_actual"] - data["eps_estimate"]) / data["eps_estimate"] * 100
+            line += f"；同季法人預估 EPS：{data['eps_estimate']:.2f} 元；官方驚喜度：{rate:+.2f}%"
+        lines.append(line + "（來源：yfinance 實數）")
+    if data["revenue_actual"] is not None:
+        lines.append(
+            f"- 最新一季實際營收：{_fmt_revenue(data['revenue_actual'])}（來源：yfinance 實數）"
+        )
+    if data["revenue_yoy"] is not None:
+        lines.append(
+            f"- 最近一季營收年增率（YoY）：{data['revenue_yoy']:+.2f}%（可用於推估基準）"
+        )
+    if data["avg_eps_4q"] is not None:
+        lines.append(
+            f"- 近 4 季平均 EPS：{data['avg_eps_4q']:.2f} 元（可作為法人預估基準）"
+        )
+    data["text"] = "\n".join(lines)
+    return data
+
+
+def _apply_fundamentals(parsed: dict, fund: dict) -> dict:
+    """用 yfinance 真實數據覆蓋模型回傳值，並在有預估+實際時重算驚喜度。"""
+    if not fund:
+        return parsed
+
+    if fund.get("revenue_actual") is not None:
+        parsed["actual_revenue"] = (
+            f"{_fmt_revenue(fund['revenue_actual'])}（yfinance 實數）"
+        )
+
+    eps_actual = fund.get("eps_actual")
+    eps_estimate = fund.get("eps_estimate")
+    if eps_actual is not None:
+        parsed["actual_eps"] = f"{eps_actual:.2f} 元（yfinance 實數）"
+
+    # 同時具備法人預估與實際 → 用真實數據直接計算驚喜度（非推估）
+    if eps_actual is not None and eps_estimate:
+        rate = (eps_actual - eps_estimate) / eps_estimate * 100
+        parsed["expected_eps"] = f"{eps_estimate:.2f} 元（法人預估，yfinance 實數）"
+        parsed["surprise_rate"] = round(rate, 2)
+        parsed["surprise_status"] = _status_from_rate(rate)
+        parsed["surprise_is_estimate"] = False
+    return parsed
+
+
 def _to_number(value):
     """把模型回傳的數值（數字或 '12.5%' 類字串）轉成 float，失敗回傳 None。"""
     if value is None or isinstance(value, bool):
@@ -316,6 +484,9 @@ def _parse_analysis(text: str):
         # 財報與營收驚喜度（Earnings Surprise）欄位
         "surprise_status": str(data.get("surprise_status", "")).strip(),
         "surprise_rate": _to_number(data.get("surprise_rate")),
+        "surprise_is_estimate": str(
+            data.get("surprise_is_estimate", "true")
+        ).strip().lower() in ("true", "1", "yes"),
         "expected_eps": str(data.get("expected_eps", "") or "").strip(),
         "actual_eps": str(data.get("actual_eps", "") or "").strip(),
         "expected_revenue": str(data.get("expected_revenue", "") or "").strip(),
@@ -338,11 +509,16 @@ def analyze_stock_with_gemini(stock_name, stock_symbol, tech_summary: str = ""):
     if not news_block:
         news_block = "（暫無近期網路新聞，請依技術面資料判斷，並註明資料有限）"
 
+    # 資料備援：呼叫 Gemini 前，先從 yfinance 抓真實財報數據
+    fund = fetch_fundamentals(stock_symbol)
+
     prompt = f"""你是台股資深研究員，擅長基本面、技術面與題材面的綜合判斷。
 請針對下列標的執行「AI 股市三健檢」，並**嚴格只回傳一個 JSON 物件**（不要 markdown、不要任何額外文字）。
 
 【標的】{stock_name}（{stock_symbol}）
 【技術面數據】{tech_summary if tech_summary else "（未提供）"}
+【yfinance 即時財務數據（真實數據優先採用）】
+{fund["text"] if fund["text"] else "（yfinance 未提供財務數據，請依規則 3 推估基準）"}
 【近期網路新聞與法說摘要】
 {news_block}
 
@@ -354,6 +530,7 @@ def analyze_stock_with_gemini(stock_name, stock_symbol, tech_summary: str = ""):
   "future_dynamics": "【3. 未來動態性】最新接單情況、訂單能見度、新產品與研發進度，條列，200字內",
   "surprise_status": "四選一：強烈超預期 🚀 / 符合預期 ⚖️ / 低於預期 ⚠️ / 資料不足 ❓",
   "surprise_rate": 驚喜度百分比數字（公式：（實際-預期）/預期×100，以最新一季 EPS 計算，保留兩位小數；無法計算時填 null）,
+  "surprise_is_estimate": true或false（true=預估基準為推估、false=市場法人共識數字）,
   "expected_eps": "最新一季的市場法人預估 EPS（含季度與幣別）",
   "actual_eps": "最新公佈的實際 EPS（含季度與幣別）",
   "expected_revenue": "最新一季的市場法人預估營收（含單位）",
@@ -363,11 +540,12 @@ def analyze_stock_with_gemini(stock_name, stock_symbol, tech_summary: str = ""):
 
 要求：
 1. 三大核心指標與財報驚喜度區塊必須涵蓋，缺一不可。
-2. 【財報驚喜度】請檢索並對比市場**法人預估的 EPS / 營收**與公司**最新公佈的實際 EPS / 營收**，自行計算驚喜度百分比。
-3. 狀態判斷基準：驚喜度 > 5% →「強烈超預期 🚀」；-5% ~ +5% →「符合預期 ⚖️」；< -5% →「低於預期 ⚠️」。
-4. 若查不到可靠的預估或實際數字，surprise_status 填「資料不足 ❓」、surprise_rate 填 null、其餘財報欄位填「N/A」，**嚴禁虛構數字**。
-5. 新聞若不足，請明確寫「網路資料有限」，不得把不確定資訊寫成確定事實。
-6. 語氣務實，不得有保證獲利的字眼。"""
+2. 【財報驚喜度】請檢索並對比市場**法人預估的 EPS / 營收**與公司**最新公佈的實際 EPS / 營收**，自行計算驚喜度百分比；若上方已提供 yfinance 真實數據，實際值一律以其為準。
+3. **預估基準規則**：若新聞中未直接標示「法人預估數字」，請根據該股近期的**月營收年增率（YoY）**與**過去四季平均 EPS** 進行合理的基準預估再對比，並將 surprise_is_estimate 設為 true、在文字中標註「(推估)」；若來自市場法人共識則設為 false。
+4. **狀態判斷基準**：驚喜度 > 5% →「強烈超預期 🚀」；-5% ~ +5% →「符合預期 ⚖️」；< -5% →「低於預期 ⚠️」。
+5. **除非完全沒有任何財務數據，否則不要輕易輸出 N/A**；只有查無任何實際與可推估數據時，才填「資料不足 ❓」與 null，嚴禁虛構確定性數字。
+6. 新聞若不足，請明確寫「網路資料有限」，不得把不確定資訊寫成確定事實。
+7. 語氣務實，不得有保證獲利的字眼。"""
 
     try:
         client = genai.Client(api_key=api_key)
@@ -388,7 +566,8 @@ def analyze_stock_with_gemini(stock_name, stock_symbol, tech_summary: str = ""):
                 "模型回傳內容無法解析為 JSON，原始回應前 200 字："
                 f"{str(resp.text)[:200]}"
             )
-        return parsed
+        # yfinance 有抓到實數時，直接覆蓋並帶入驚喜度計算
+        return _apply_fundamentals(parsed, fund)
     except Exception:
         # 不吞掉錯誤：交由呼叫端捕捉，並在畫面上顯示完整錯誤訊息
         raise
@@ -418,6 +597,7 @@ SAMPLE_ANALYSIS = {
     # 財報與營收驚喜度（靜態範例）
     "surprise_status": "強烈超預期 🚀",
     "surprise_rate": 11.30,
+    "surprise_is_estimate": True,  # 靜態範例：預估基準為推估
     "expected_eps": "1.15 元（2026 Q3）",
     "actual_eps": "1.28 元（2026 Q3）",
     "expected_revenue": "655.0 億（2026 Q3）",
@@ -442,6 +622,7 @@ def render_surprise_block(result: dict) -> None:
     with st.expander("🎯 財報與營收驚喜度檢測 (Earnings Surprise Model)", expanded=True):
         status = str(result.get("surprise_status", "")).strip() or "（模型未回傳狀態）"
         rate = result.get("surprise_rate")
+        is_estimate = bool(result.get("surprise_is_estimate"))
 
         expected_eps = str(result.get("expected_eps", "") or "").strip() or "N/A"
         actual_eps = str(result.get("actual_eps", "") or "").strip() or "N/A"
@@ -454,11 +635,13 @@ def render_surprise_block(result: dict) -> None:
         col_eps1, col_eps2, col_eps3 = st.columns(3)
         col_eps1.metric("法人預期 EPS", expected_eps)
         col_eps2.metric("實際公佈 EPS", actual_eps)
-        col_eps3.metric(
-            "驚喜度差距 %",
-            f"{rate:+.2f}%" if rate is not None else "N/A",
-            delta=f"{rate:+.2f}%" if rate is not None else None,
-        )
+        if rate is not None:
+            gap_value = f"{rate:+.2f}%" + (" (推估)" if is_estimate else "")
+            gap_delta = f"{rate:+.2f}%" + (" 推估" if is_estimate else "")
+        else:
+            gap_value = "N/A"
+            gap_delta = None
+        col_eps3.metric("驚喜度差距 %", gap_value, delta=gap_delta)
 
         # 預期營收 / 實際營收
         col_rev1, col_rev2 = st.columns(2)
