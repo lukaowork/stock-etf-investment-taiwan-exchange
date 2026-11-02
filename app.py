@@ -66,25 +66,75 @@ with top_col2:
         st.session_state["authenticated"] = False
         st.rerun()
 
-# 側邊欄：控制面板
+# ---------------------------------------------------------
+# 側邊欄：動態新增自選股
+# ---------------------------------------------------------
 st.sidebar.header("⚙️ 控制面板")
 
-# 預設自選標的對照表
-STOCK_DICT = {
-    "台積電 (2330)": "2330.TW",
-    "鴻海 (2317)": "2317.TW",
-    "聯發科 (2454)": "2454.TW",
-    "元大台灣50 (0050)": "0050.TW",
-    "國泰永續高股息 (00878)": "00878.TW",
-    "群益台灣精選高息 (00919)": "00919.TW",
-    "復華台灣科技優息 (00929)": "00929.TW"
-}
+# 1. 使用 session_state 儲存股票選單字典，避免重新整理時消失
+if "custom_stocks" not in st.session_state:
+    st.session_state["custom_stocks"] = {
+        "台積電 (2330)": "2330.TW",
+        "鴻海 (2317)": "2317.TW",
+        "聯發科 (2454)": "2454.TW",
+        "元大台灣50 (0050)": "0050.TW",
+        "國泰永續高股息 (00878)": "00878.TW",
+        "群益台灣精選高息 (00919)": "00919.TW",
+        "復華台灣科技優息 (00929)": "00929.TW"
+    }
 
-# 使用者選擇標的
+# 2. 手動新增股票的功能區
+with st.sidebar.expander("➕ 新增自選股票/ETF"):
+    new_name = st.text_input("顯示名稱（例如：廣達）", key="input_name")
+    new_symbol = st.text_input("台股代號（例如：2382）", key="input_symbol")
+
+    if st.button("加入選單", use_container_width=True):
+        name_input = new_name.strip()
+        symbol_input = new_symbol.strip().upper()
+
+        if not name_input or not symbol_input:
+            st.warning("⚠️ 請完整填寫顯示名稱與代號。")
+        else:
+            # 拆出純代號與附檔名（支援 2382 / 2382.TW / 2382.TWO 三種輸入）
+            if symbol_input.endswith(".TWO"):
+                code_part, clean_symbol = symbol_input[:-4], symbol_input
+            elif symbol_input.endswith(".TW"):
+                code_part, clean_symbol = symbol_input[:-3], symbol_input
+            else:
+                code_part, clean_symbol = symbol_input, symbol_input + ".TW"
+
+            if not code_part.isdigit():
+                st.warning("⚠️ 代號請輸入 4~6 位數字（例如：2382，上櫃可加 .TWO）。")
+            else:
+                formatted_label = f"{name_input} ({code_part})"
+
+                if formatted_label in st.session_state["custom_stocks"]:
+                    st.warning(f"⚠️ {formatted_label} 已存在於選單中。")
+                else:
+                    st.session_state["custom_stocks"][formatted_label] = clean_symbol
+                    st.session_state["pending_select"] = formatted_label
+                    # 不呼叫 st.rerun()，讓下方 multiselect 同一次執行就帶入新選項，
+                    # 同時 st.success 的提示也能正常顯示
+                    st.success(f"✅ 已成功新增 {formatted_label} → {clean_symbol}！")
+
+# 下方對照的標的字典改為調用 session_state
+STOCK_DICT = st.session_state["custom_stocks"]
+
+# 3. 供使用者選擇要追蹤的股票
+# 預設值寫入 session_state（用 key 綁定），新增的股票可自動勾選
+if "watchlist" not in st.session_state:
+    st.session_state["watchlist"] = ["台積電 (2330)", "元大台灣50 (0050)"]
+
+# 剛加入選單的股票自動加入勾選（此段在 multiselect 建立之前執行，符合 Streamlit 規則）
+if "pending_select" in st.session_state:
+    pending = st.session_state.pop("pending_select")
+    if pending in STOCK_DICT and pending not in st.session_state["watchlist"]:
+        st.session_state["watchlist"].append(pending)
+
 selected_labels = st.sidebar.multiselect(
     "選擇要追蹤的股票 / ETF：",
     options=list(STOCK_DICT.keys()),
-    default=["台積電 (2330)", "元大台灣50 (0050)"]
+    key="watchlist",
 )
 
 # 選擇觀察時間區間
