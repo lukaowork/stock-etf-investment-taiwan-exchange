@@ -27,13 +27,16 @@ except Exception:
     feedparser = None
     FEEDPARSER_AVAILABLE = False
 
-# st-gsheets-connection 為可選套件，未安裝時自選股改存本機 session_state
-try:
-    from streamlit_gsheets import GSheetsConnection
-    GSHEETS_AVAILABLE = True
-except Exception:
-    GSheetsConnection = None
-    GSHEETS_AVAILABLE = False
+# 共用模組（供 app.py 與 pages/ 多頁共用，遵循 DRY）
+from auth_gate import check_password
+from gsheets_store import (
+    DEFAULT_WATCHLIST,
+    fetch_transactions_frame,
+    get_gsheets_connection,
+    gsheets_can_write,
+    load_watchlist_stocks,
+)
+from market_data import get_symbol_frame
 
 # 1. 頁面配置
 st.set_page_config(
@@ -42,128 +45,13 @@ st.set_page_config(
     layout="wide"
 )
 
-# 2. 登入驗證機制（密碼存放於 .streamlit/secrets.toml，程式碼中不出現明文）
-def get_configured_password() -> str:
-    """從 Streamlit secrets 讀取存取密碼；未設定時回傳空字串。"""
-    try:
-        pwd = st.secrets["app_password"]
-        return str(pwd)
-    except Exception:
-        return ""
-
-
-def check_password():
-    if "authenticated" not in st.session_state:
-        st.session_state["authenticated"] = False
-
-    if st.session_state["authenticated"]:
-        return True
-
-    configured_password = get_configured_password()
-    if not configured_password:
-        st.error(
-            "⚠️ 未設定存取密碼。請在 `.streamlit/secrets.toml` 中加入：\n\n"
-            "```toml\napp_password = \"你的密碼\"\n```"
-        )
-        return False
-
-    st.markdown("<h1 style='text-align: center;'>🔒 登入個人投資分析系統</h1>", unsafe_allow_html=True)
-    st.markdown("---")
-
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        password_input = st.text_input("請輸入系統存取密碼：", type="password")
-        if st.button("登入系統", use_container_width=True):
-            if password_input == configured_password:
-                st.session_state["authenticated"] = True
-                st.rerun()
-            else:
-                st.error("❌ 密碼錯誤！請重新輸入。")
-    return False
-
+# 2. 登入驗證機制（實作於 auth_gate.py，密碼存放於 .streamlit/secrets.toml）
 if not check_password():
     st.stop()  # 未驗證成功則中斷後續程式碼執行
 
 # ---------------------------------------------------------
-# 2.5 Google Sheets 串接（st-gsheets-connection）
+# 2.5 自選股寫回 Google Sheets（讀取相關函式已抽至 gsheets_store.py）
 # ---------------------------------------------------------
-GSHEETS_SPREADSHEET = (
-    "https://docs.google.com/spreadsheets/d/"
-    "11LXIBpOyjvqIrvzjkyoyc0pZSulI3D0in0va2cfi0aI/edit?usp=sharing"
-)
-
-
-def get_gsheets_connection():
-    """建立 st.connection("gsheets")；未安裝套件或未設定 secrets 時回傳 None。"""
-    if not GSHEETS_AVAILABLE:
-        return None
-    try:
-        return st.connection("gsheets", type=GSheetsConnection)
-    except Exception:
-        return None
-
-
-def _gsheets_is_crud() -> bool:
-    """是否為服務帳戶 CRUD 模式（可讀寫）；唯讀公開連結只能讀取。"""
-    try:
-        cfg = st.secrets["connections"]["gsheets"]
-        try:
-            raw = cfg.get("type", "")
-        except Exception:
-            raw = cfg["type"] if "type" in cfg else ""
-        return str(raw).strip().lower() == "service_account"
-    except Exception:
-        return False
-
-
-def _sheet_frame(worksheet: str):
-    """讀取指定工作表為 DataFrame；失敗回傳 None。
-
-    - 服務帳戶模式：走 st.connection（可讀寫）
-    - 唯讀模式 / 未設定 secrets：走 Google Sheets 公開 gviz CSV 備援
-    """
-    if _gsheets_is_crud():
-        conn = get_gsheets_connection()
-        if conn is not None:
-            try:
-                df = conn.read(worksheet=worksheet, ttl=60)
-                if df is not None:
-                    return pd.DataFrame(df)
-            except Exception:
-                pass
-    try:
-        url = (
-            "https://docs.google.com/spreadsheets/d/"
-            "11LXIBpOyjvqIrvzjkyoyc0pZSulI3D0in0va2cfi0aI"
-            f"/gviz/tq?tqx=out:csv&sheet={worksheet}"
-        )
-        return pd.read_csv(url)
-    except Exception:
-        return None
-
-
-def load_watchlist_stocks() -> dict:
-    """讀取 Watchlist 工作表，轉成 {顯示名稱: yfinance代號}；失敗回傳空 dict。"""
-    df = _sheet_frame("Watchlist")
-    if df is None or df.empty:
-        return {}
-    df = df.rename(columns={c: str(c).strip().lower() for c in df.columns})
-    if "symbol" not in df.columns or "name" not in df.columns:
-        return {}
-
-    stocks = {}
-    for _, row in df.iterrows():
-        raw_symbol = str(row["symbol"]).strip().upper()
-        name = str(row["name"]).strip()
-        code = raw_symbol.split(".")[0]
-        if not code.isdigit() or not name or name.lower() == "nan":
-            continue
-        symbol = raw_symbol if raw_symbol.endswith((".TW", ".TWO")) else f"{code}.TW"
-        label = name if f"({code})" in name else f"{name} ({code})"
-        stocks[label] = symbol
-    return stocks
-
-
 def sync_watchlist_to_sheets() -> bool:
     """把 session 中的自選股清單寫回 Watchlist 工作表，成功回傳 True。
 
@@ -171,7 +59,7 @@ def sync_watchlist_to_sheets() -> bool:
     - 寫入成功後執行 st.cache_data.clear()，確保立即重新讀取最新數據
     - 失敗時丟出 Exception（含詳細原因），由呼叫端以 st.error 顯示
     """
-    if not _gsheets_is_crud():
+    if not gsheets_can_write():
         raise Exception(
             '目前為唯讀模式（secrets 未設定 type = "service_account"），'
             "沒有 Google Sheets 寫入權限；請於 .streamlit/secrets.toml 的 "
@@ -240,11 +128,6 @@ def sync_watchlist_to_sheets() -> bool:
     return True
 
 
-def fetch_transactions_frame():
-    """讀取 Transactions 工作表（庫存帳本來源），失敗回傳 None。"""
-    return _sheet_frame("Transactions")
-
-
 # ---------------------------------------------------------
 # 3. 登入成功後的主畫面
 # ---------------------------------------------------------
@@ -270,16 +153,8 @@ if "custom_stocks" not in st.session_state:
         st.session_state["custom_stocks"] = sheet_stocks
         st.session_state["watchlist_from_sheets"] = True
     else:
-        # Sheets 讀取失敗或為空時，退回內建預設清單
-        st.session_state["custom_stocks"] = {
-            "台積電 (2330)": "2330.TW",
-            "鴻海 (2317)": "2317.TW",
-            "聯發科 (2454)": "2454.TW",
-            "元大台灣50 (0050)": "0050.TW",
-            "國泰永續高股息 (00878)": "00878.TW",
-            "群益台灣精選高息 (00919)": "00919.TW",
-            "復華台灣科技優息 (00929)": "00929.TW"
-        }
+        # Sheets 讀取失敗或為空時，退回內建預設清單（DEFAULT_WATCHLIST 於 gsheets_store.py）
+        st.session_state["custom_stocks"] = dict(DEFAULT_WATCHLIST)
         st.session_state["watchlist_from_sheets"] = False
 
 # 側邊欄標示清單來源
@@ -392,32 +267,6 @@ selected_labels = st.sidebar.multiselect(
 time_frame = st.sidebar.selectbox("資料時間範圍：", ["近 3 個月", "近 6 個月", "近 1 年", "近 3 年"], index=2)
 days_map = {"近 3 個月": 90, "近 6 個月": 180, "近 1 年": 365, "近 3 年": 1095}
 start_date = datetime.now() - timedelta(days=days_map[time_frame])
-
-
-def get_symbol_frame(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
-    """從 yf.download 的回傳值取出單一標的的 OHLCV 資料。
-
-    相容各種回傳結構：
-    - 單一標的、一般欄位（Open/High/Low/Close/Volume）
-    - 多標的、MultiIndex 欄位（第一層為價格欄或代號，皆可處理）
-    """
-    if isinstance(raw.columns, pd.MultiIndex):
-        level_values = list(raw.columns.get_level_values(-1))
-        if symbol in level_values:
-            df = raw.xs(symbol, axis=1, level=-1)
-        else:
-            level_values0 = list(raw.columns.get_level_values(0))
-            if symbol not in level_values0:
-                return pd.DataFrame()
-            df = raw.xs(symbol, axis=1, level=0)
-    else:
-        df = raw
-
-    required = ["Open", "High", "Low", "Close", "Volume"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        return pd.DataFrame()
-    return df[required].dropna(how="all")
 
 
 # ---------------------------------------------------------
