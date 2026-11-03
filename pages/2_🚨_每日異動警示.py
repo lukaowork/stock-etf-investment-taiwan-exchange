@@ -13,11 +13,10 @@ from datetime import datetime, timedelta
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import yfinance as yf
 
 from auth_gate import check_password
 from gsheets_store import DEFAULT_WATCHLIST, load_watchlist_stocks
-from market_data import DEFAULT_BENCHMARK, build_alert_table, get_symbol_frame
+from market_data import DEFAULT_BENCHMARK, build_alert_table, download_frames
 
 # 頁面配置必須是本頁第一個 Streamlit 指令
 st.set_page_config(page_title="每日異動警示", page_icon="🚨", layout="wide")
@@ -56,31 +55,17 @@ def resolve_watchlist() -> dict:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_frames(symbols: tuple, benchmark: str, start: str) -> dict:
-    """批次抓取自選股與基準指數的 OHLCV，回傳 {代號: DataFrame}；失敗回傳空 dict。"""
+    """批次抓取自選股與基準指數的 OHLCV，回傳 {代號: DataFrame}。
+
+    主代號回傳為空時由 download_frames 自動改試備用代號（先 .TWO 再 .TW）；
+    完全抓不到資料時回傳空 dict。
+    """
     tickers = list(dict.fromkeys(list(symbols) + [benchmark]))
-    try:
-        raw = yf.download(
-            tickers,
-            start=start,
-            progress=False,
-            group_by="ticker",
-            threads=True,
-        )
-    except Exception:
-        return {}
-
-    if raw is None or len(raw) == 0:
-        return {}
-
-    frames = {}
-    for ticker in tickers:
-        try:
-            frame = get_symbol_frame(raw, ticker)
-            if not frame.empty:
-                frames[ticker] = frame
-        except Exception:
-            continue
-    return frames
+    frames = download_frames(tickers, start=start)
+    # 只保留真正有資料的標的（含基準指數），維持既有空值判斷
+    return {
+        code: df for code, df in frames.items() if df is not None and not df.empty
+    }
 
 
 # ---------------------------------------------------------

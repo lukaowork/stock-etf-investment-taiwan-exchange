@@ -7,6 +7,7 @@
 """
 
 import pandas as pd
+import yfinance as yf
 
 # yf.download 所需的標準欄位
 REQUIRED_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
@@ -36,6 +37,101 @@ def get_symbol_frame(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     if missing:
         return pd.DataFrame()
     return df[REQUIRED_COLUMNS].dropna(how="all")
+
+
+def ticker_candidates(symbol: str) -> list:
+    """產生 yfinance 代號候選清單，自動相容上市（.TW）與上櫃（.TWO）後綴。
+
+    第 1 個為主代號（優先請求，避免多餘流量）；若主代號回傳為空，
+    依序改試備用代號：先 .TWO（上櫃），再 .TW（上市）。
+    非台股純數字代號（如 ^TWII、AAPL）不加後綴，只回傳原代號。
+    """
+    raw = str(symbol or "").strip().upper()
+    if not raw:
+        return []
+    code = raw.split(".")[0]
+    if not code.isdigit():
+        return [raw]
+
+    primary = raw if raw.endswith((".TW", ".TWO")) else f"{code}.TW"
+    candidates = [primary]
+    for suffix in (".TWO", ".TW"):
+        alternate = f"{code}{suffix}"
+        if alternate not in candidates:
+            candidates.append(alternate)
+    return candidates
+
+
+def download_frames(symbols, start=None, period=None, threads=True) -> dict:
+    """批次下載多檔標的的 OHLCV，回傳 {原始代號: DataFrame}。
+
+    - 主代號回傳為 Empty（例如上櫃股票被預設成 .TW）時，自動改試備用代號：
+      先 .TWO（上櫃），再 .TW（上市）；且只針對失敗標的補抓，避免重複請求
+    - 無法取得資料的標的回傳空 DataFrame，由呼叫端以 st.warning 降級提示
+    - 本函式不含快取，請由呼叫端以 @st.cache_data(ttl=3600) 包覆（AGENTS.md 快取規範）
+    """
+    requested = []
+    for item in symbols or []:
+        code = str(item).strip().upper()
+        if code and code not in requested:
+            requested.append(code)
+    if not requested:
+        return {}
+
+    # 主代號：未帶上市/上櫃後綴的純數字代號補上預設 .TW
+    primary = {code: ticker_candidates(code)[0] for code in requested}
+
+    def _download(codes):
+        """執行一次 yf.download；失敗或空結果回傳 None。"""
+        if not codes:
+            return None
+        kwargs = {"progress": False, "group_by": "ticker", "threads": threads}
+        if start is not None:
+            kwargs["start"] = start
+        else:
+            kwargs["period"] = period or "1mo"
+        try:
+            raw = yf.download(list(codes), **kwargs)
+        except Exception:
+            return None
+        if raw is None or len(raw) == 0:
+            return None
+        return raw
+
+    frames = {}
+    pending = []
+
+    raw = _download(list(dict.fromkeys(primary.values())))
+    for code in requested:
+        frame = get_symbol_frame(raw, primary[code]) if raw is not None else pd.DataFrame()
+        if frame is not None and not frame.empty:
+            frames[code] = frame
+        else:
+            pending.append(code)
+
+    # 主代號回傳 Empty：批次改試備用代號（先 .TWO 上櫃，再 .TW 上市）
+    backup = {}
+    for code in pending:
+        for candidate in ticker_candidates(code)[1:]:
+            backup.setdefault(candidate, []).append(code)
+    if backup:
+        raw_backup = _download(list(backup))
+        for candidate, codes in backup.items():
+            frame = (
+                get_symbol_frame(raw_backup, candidate)
+                if raw_backup is not None
+                else pd.DataFrame()
+            )
+            if frame is None or frame.empty:
+                continue
+            for code in codes:
+                if code in pending:
+                    frames[code] = frame
+                    pending.remove(code)
+
+    for code in requested:
+        frames.setdefault(code, pd.DataFrame())
+    return frames
 
 
 def compute_volume_zscore(volume: pd.Series, window: int = 20) -> pd.Series:

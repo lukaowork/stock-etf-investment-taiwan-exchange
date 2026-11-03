@@ -36,7 +36,7 @@ from gsheets_store import (
     gsheets_can_write,
     load_watchlist_stocks,
 )
-from market_data import get_symbol_frame
+from market_data import download_frames
 
 # 1. 頁面配置
 st.set_page_config(
@@ -1158,19 +1158,16 @@ def fetch_latest_prices(symbol_list) -> dict:
     if not symbols:
         return prices
 
-    # 主路徑：一次批次下載，用共用的 get_symbol_frame 拆欄
+    # 主路徑：一次批次下載；主代號為空時由 download_frames 自動改試備用代號
     try:
-        data = yf.download(
-            symbols, period="5d", progress=False, group_by="ticker", threads=True
-        )
-        if data is not None and len(data) > 0:
-            for sym in symbols:
-                try:
-                    closes = get_symbol_frame(data, sym)["Close"].dropna()
-                    if len(closes):
-                        prices[sym] = float(closes.iloc[-1])
-                except Exception:
-                    continue
+        price_frames = download_frames(symbols, period="5d")
+        for sym in symbols:
+            try:
+                closes = price_frames.get(sym, pd.DataFrame())["Close"].dropna()
+                if len(closes):
+                    prices[sym] = float(closes.iloc[-1])
+            except Exception:
+                continue
     except Exception:
         pass
 
@@ -1343,27 +1340,21 @@ else:
 
     @st.cache_data(ttl=3600)  # 快取資料 1 小時以提升載入速度
     def load_data(symbol_list, start):
-        data = yf.download(
-            symbol_list,
-            start=start,
-            progress=False,
-            group_by="ticker",
-            threads=True,
-        )
-        return data
+        # 回傳 {代號: DataFrame}；主代號為空時自動改試備用代號（先 .TWO 再 .TW）
+        return download_frames(symbol_list, start=start)
 
-    data_raw = load_data(symbols, start_date)
+    raw_by_symbol = load_data(symbols, start_date)
 
-    # 資料載入失敗（斷線、代號無資料等）的統一檢查
-    if data_raw is None or len(data_raw) == 0:
+    # 資料載入全數失敗（斷線等）的統一檢查；個別標的缺資料則交由各分頁降級提示
+    if not raw_by_symbol or all(df.empty for df in raw_by_symbol.values()):
         st.error("⚠️ 無法取得任何行情資料，請確認網路連線後再試一次。")
         st.stop()
 
-    # 預先取出各標的的乾淨 OHLCV，供後續分頁共用
-    frames = {}
-    for label in selected_labels:
-        sym = STOCK_DICT[label]
-        frames[label] = get_symbol_frame(data_raw, sym)
+    # 預先取出各標的的乾淨 OHLCV（以顯示名稱為 key），供後續分頁共用
+    frames = {
+        label: raw_by_symbol.get(STOCK_DICT[label], pd.DataFrame())
+        for label in selected_labels
+    }
 
 
     # 主畫面 6 大分頁
