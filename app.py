@@ -1381,24 +1381,29 @@ else:
     # -----------------------------------------------------
     with tab1:
         st.subheader("📌 自選標的即時概況")
-        cols = st.columns(len(selected_labels))
 
-        for idx, label in enumerate(selected_labels):
-            with cols[idx]:
-                df_sym = frames[label]
-                close_series = df_sym["Close"].dropna() if not df_sym.empty else pd.Series(dtype=float)
-                if len(close_series) >= 2:
-                    latest_p = float(close_series.iloc[-1])
-                    prev_p = float(close_series.iloc[-2])
-                    diff = latest_p - prev_p
-                    pct = (diff / prev_p) * 100
-                    st.metric(
-                        label=label,
-                        value=f"{latest_p:.2f} 元",
-                        delta=f"{diff:+.2f} 元 ({pct:+.2f}%)",
-                    )
-                else:
-                    st.error(f"{label} 資料不足或載入異常")
+        # 網格排版：每行最多 4 欄，超出的標的自動換行，避免一次性展開過多欄位造成畫面擠壓
+        grid_columns = 4
+        for row_start in range(0, len(selected_labels), grid_columns):
+            row_labels = selected_labels[row_start:row_start + grid_columns]
+            row_cols = st.columns(grid_columns)
+            for col, label in zip(row_cols, row_labels):
+                with col:
+                    df_sym = frames[label]
+                    close_series = df_sym["Close"].dropna() if not df_sym.empty else pd.Series(dtype=float)
+                    if len(close_series) >= 2:
+                        latest_p = float(close_series.iloc[-1])
+                        prev_p = float(close_series.iloc[-2])
+                        diff = latest_p - prev_p
+                        pct = (diff / prev_p) * 100
+                        st.metric(
+                            label=label,
+                            value=f"{latest_p:.2f} 元",
+                            delta=f"{diff:+.2f} 元 ({pct:+.2f}%)",
+                        )
+                    else:
+                        # 個別標的資料不足時降級顯示，不影響其他標的（AGENTS.md 防禦性程式設計）
+                        st.warning(f"{label} 資料不足或載入異常")
 
     # -----------------------------------------------------
     # Tab 2: K線與技術分析 (K-Line Chart)
