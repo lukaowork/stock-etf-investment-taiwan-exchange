@@ -1313,11 +1313,13 @@ else:
     symbols = [STOCK_DICT[label] for label in selected_labels]
 
     @st.cache_data(ttl=3600)  # 快取資料 1 小時以提升載入速度
-    def load_data(symbol_list, start):
+    def load_data(symbol_list, start: str):
         # 回傳 {代號: DataFrame}；主代號為空時自動改試備用代號（先 .TWO 再 .TW）
+        # start 必須是日期字串（非含微秒的 datetime），快取鍵才會穩定命中
         return download_frames(symbol_list, start=start)
 
-    raw_by_symbol = load_data(symbols, start_date)
+    # 統一轉為 "YYYY-MM-DD" 字串：datetime.now() 含微秒，直接當快取鍵會每次 rerun 都失效
+    raw_by_symbol = load_data(symbols, start_date.strftime("%Y-%m-%d"))
 
     # 資料載入全數失敗（斷線等）的統一檢查；個別標的缺資料則交由各分頁降級提示
     if not raw_by_symbol or all(df.empty for df in raw_by_symbol.values()):
