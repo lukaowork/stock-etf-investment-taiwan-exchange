@@ -36,7 +36,12 @@ from gsheets_store import (
     gsheets_can_write,
     load_watchlist_stocks,
 )
-from market_data import download_frames
+from market_data import (
+    build_indicator_summary,
+    download_frames,
+    fetch_benchmark_close,
+    get_cached_ai_analysis,
+)
 
 # 1. 頁面配置
 st.set_page_config(
@@ -309,39 +314,6 @@ def fetch_recent_news(stock_name: str, stock_symbol: str, max_items: int = 6) ->
     except Exception:
         return ""
     return "\n".join(titles)
-
-
-def _build_tech_summary(df: pd.DataFrame) -> str:
-    """組出最新股價與 20MA/60MA 位階描述，供 Prompt 使用。"""
-    if df is None or df.empty:
-        return "（無技術面資料）"
-    close = df["Close"].dropna()
-    if len(close) < 2:
-        return "（資料不足，無法計算均線）"
-
-    price = float(close.iloc[-1])
-    ma20 = float(close.tail(20).mean()) if len(close) >= 20 else None
-    ma60 = float(close.tail(60).mean()) if len(close) >= 60 else None
-
-    def _pos(ma, name):
-        if ma is None:
-            return f"{name}：資料期間不足以計算"
-        diff = (price - ma) / ma * 100
-        where = "上方" if price > ma else "下方"
-        return f"{name}={ma:.2f} 元（股價在其{where} {abs(diff):.2f}%）"
-
-    parts = [
-        f"最新收盤價 {price:.2f} 元",
-        _pos(ma20, "20MA（月線）"),
-        _pos(ma60, "60MA（季線）"),
-    ]
-    if ma20 is not None and ma60 is not None:
-        parts.append(
-            "均線型態：短均在長均之上（多頭排列）"
-            if ma20 > ma60
-            else "均線型態：短均在長均之下（空頭排列）"
-        )
-    return "；".join(parts) + "。"
 
 
 def _fmt_revenue(value: float) -> str:
@@ -847,9 +819,11 @@ def _parse_analysis(text: str):
     }
 
 
-def analyze_stock_with_gemini(stock_name, stock_symbol, tech_summary: str = ""):
+def analyze_stock_with_gemini(stock_name, stock_symbol, indicator_summary: str = ""):
     """抓新聞 + 組 Prompt → 送 Gemini (gemini-3.8-flash)，回傳三健檢與財報驚喜度 dict。
 
+    indicator_summary 由 market_data.build_indicator_summary 預先算好
+    （收盤價 / 量能 Z-Score / 相對強度 RS% / 健康度評分），不傳送歷史資料陣列。
     失敗時丟出例外，由呼叫端捕捉並顯示詳細錯誤訊息；
     僅在未安裝套件或未設定金鑰時回傳 None。
     """
@@ -877,7 +851,7 @@ def analyze_stock_with_gemini(stock_name, stock_symbol, tech_summary: str = ""):
 請針對下列標的執行「AI 股市三健檢」，並**嚴格只回傳一個 JSON 物件**（不要 markdown、不要任何額外文字）。
 
 【標的】{stock_name}（{stock_symbol}）
-【技術面數據】{tech_summary if tech_summary else "（未提供）"}
+【Python 預先計算之指標摘要（收盤價、量能 Z-Score、相對強度 RS%、健康度評分）】{indicator_summary if indicator_summary else "（未提供）"}
 【yfinance 即時財務數據（真實數據優先採用）】
 {fund["text"] if fund["text"] else "（yfinance 未提供財務數據，請依規則 3 推估基準）"}
 【近期網路新聞與法說摘要】
@@ -1542,11 +1516,20 @@ else:
         )
 
         if run_clicked:
-            tech_summary = _build_tech_summary(frames.get(focus_label_ai))
+            # Python 預先算好指標摘要（收盤價 / 量能 Z-Score / RS% / 健康度評分），
+            # 只把精簡摘要送進 Prompt，不傳送長篇歷史資料陣列
+            indicator_summary = build_indicator_summary(
+                frames.get(focus_label_ai),
+                # 傳日期字串（而非含微秒的 datetime），確保快取鍵穩定可命中
+                fetch_benchmark_close(start_date.strftime("%Y-%m-%d")),
+            )
             try:
                 with st.spinner("AI 正在檢索最新網路資料與分析中..."):
-                    ai_result = analyze_stock_with_gemini(
-                        focus_label_ai, focus_sym_ai, tech_summary
+                    ai_result = get_cached_ai_analysis(
+                        focus_label_ai,
+                        focus_sym_ai,
+                        indicator_summary,
+                        analyze_stock_with_gemini,
                     )
             except Exception as e:
                 # 除錯用：印出真正的錯誤資訊
@@ -1582,8 +1565,10 @@ else:
         st.caption(
             "⚠️ 警示：AI 產出內容（含靜態範例）由語言模型生成，可能有誤、過時或遺漏，"
             "僅供研究參考，不構成任何投資建議；投資決策請自行查證並自負風險。\n\n"
-            "📎 資料來源：Google News RSS 近期新聞標題、本機行情計算之 20MA/60MA 均線位階，"
-            f"並由 {GEMINI_MODEL} 綜合研判。"
+            "📎 資料來源：Google News RSS 近期新聞標題、Python 預先計算之"
+            "收盤價／量能 Z-Score／相對強度 RS%／健康度評分，"
+            f"並由 {GEMINI_MODEL} 綜合研判；AI 結果按檔快取 24 小時，"
+            "同檔當日重複點擊不再消耗 API Token。"
         )
 
     # -----------------------------------------------------

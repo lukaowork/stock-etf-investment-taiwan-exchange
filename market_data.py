@@ -7,6 +7,7 @@
 """
 
 import pandas as pd
+import streamlit as st
 import yfinance as yf
 
 # yf.download 所需的標準欄位
@@ -132,6 +133,19 @@ def download_frames(symbols, start=None, period=None, threads=True) -> dict:
     for code in requested:
         frames.setdefault(code, pd.DataFrame())
     return frames
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_benchmark_close(start) -> pd.Series:
+    """抓取基準指數（^TWII）收盤價序列，供相對強度 RS% 計算（快取 1 小時）。
+
+    抓取失敗回傳空序列，由呼叫端降級提示。
+    """
+    frames = download_frames([DEFAULT_BENCHMARK], start=start)
+    frame = frames.get(DEFAULT_BENCHMARK)
+    if frame is None or frame.empty or "Close" not in frame.columns:
+        return pd.Series(dtype=float)
+    return frame["Close"].dropna()
 
 
 def compute_volume_zscore(volume: pd.Series, window: int = 20) -> pd.Series:
@@ -306,3 +320,120 @@ def build_alert_table(
         "警訊",
     ]
     return pd.DataFrame(rows, columns=columns), skipped
+
+
+def build_indicator_summary(
+    df: pd.DataFrame,
+    benchmark_close: pd.Series = None,
+    z_window: int = 20,
+    rs_window: int = 20,
+    z_threshold: float = 2.0,
+) -> str:
+    """以 Python 預先算好指標摘要，供 AI 健檢 Prompt 使用。
+
+    涵蓋收盤價、單日漲跌幅、20MA/60MA 位階、量能 Z-Score、相對強度 RS%
+    與健康度評分；回傳精簡單行文字，不附任何歷史資料陣列，以節省 Input Token。
+    """
+    if df is None or df.empty:
+        return "（無行情資料）"
+
+    close = df["Close"].dropna()
+    if len(close) < 2:
+        return "（資料不足，無法計算指標）"
+
+    price = float(close.iloc[-1])
+    prev_price = float(close.iloc[-2])
+    if prev_price:
+        pct = (price / prev_price - 1) * 100
+        pct_text = f"單日 {pct:+.2f}%"
+    else:
+        pct = float("nan")
+        pct_text = "單日漲跌幅無法計算"
+
+    # 20MA / 60MA 位階
+    ma20 = float(close.tail(20).mean()) if len(close) >= 20 else float("nan")
+    ma60 = float(close.tail(60).mean()) if len(close) >= 60 else float("nan")
+
+    def _ma_desc(ma: float, name: str) -> str:
+        """描述股價相對某條均線的位置與差距百分比。"""
+        if pd.isna(ma):
+            return f"{name}：資料期間不足以計算"
+        diff = (price - ma) / ma * 100
+        where = "上方" if price > ma else "下方"
+        return f"{name}={ma:.2f} 元（股價在其{where} {abs(diff):.2f}%）"
+
+    parts = [f"最新收盤價 {price:.2f} 元（{pct_text}）"]
+    parts.append(_ma_desc(ma20, "20MA（月線）"))
+    parts.append(_ma_desc(ma60, "60MA（季線）"))
+    if not pd.isna(ma20) and not pd.isna(ma60):
+        parts.append(
+            "均線型態：短均在長均之上（多頭排列）"
+            if ma20 > ma60
+            else "均線型態：短均在長均之下（空頭排列）"
+        )
+
+    # 量能 Z-Score（當日量相對 20 日均量的標準差倍數）
+    volume = df["Volume"].dropna() if "Volume" in df.columns else pd.Series(dtype=float)
+    z_score = float("nan")
+    vol_ratio = float("nan")
+    if len(volume) > z_window:
+        z_series = compute_volume_zscore(volume, z_window)
+        z_score = float(z_series.iloc[-1]) if len(z_series) else float("nan")
+        mean_vol = volume.rolling(z_window).mean().iloc[-1]
+        if pd.notna(mean_vol) and mean_vol > 0:
+            vol_ratio = float(volume.iloc[-1]) / float(mean_vol)
+    if pd.notna(z_score):
+        ratio_text = f"{vol_ratio:.2f}x" if pd.notna(vol_ratio) else "無法計算"
+        parts.append(
+            f"量能 Z-Score={z_score:.2f}（門檻 {z_threshold}，量能倍數 {ratio_text}）"
+        )
+    else:
+        parts.append("量能 Z-Score：資料期間不足以計算")
+
+    # 相對強度 RS%：個股報酬 - 基準指數報酬
+    rs = float("nan")
+    bench = (
+        benchmark_close.dropna()
+        if isinstance(benchmark_close, pd.Series)
+        else pd.Series(dtype=float)
+    )
+    if len(close) > rs_window and len(bench) > rs_window:
+        base_price = float(close.iloc[-1 - rs_window])
+        bench_base = float(bench.iloc[-1 - rs_window])
+        if base_price and bench_base:
+            stock_ret = (price / base_price - 1) * 100
+            bench_ret = (float(bench.iloc[-1]) / bench_base - 1) * 100
+            rs = stock_ret - bench_ret
+    if pd.notna(rs):
+        parts.append(
+            f"相對強度 RS={rs:+.2f}%（近 {rs_window} 個交易日，基準 {DEFAULT_BENCHMARK}）"
+        )
+    else:
+        parts.append("相對強度 RS：基準指數或歷史資料不足，暫無法計算")
+
+    # 健康度評分（0 ~ 100，80 分以上為健康區間）
+    above_ma20 = bool(price > ma20) if not pd.isna(ma20) else None
+    score, signals = score_alert(z_score, pct, rs, above_ma20, z_threshold)
+    light = "🟢" if score >= 80 else ("🟡" if score >= 60 else "🔴")
+    parts.append(f"健康度評分 {score:.0f}/100（{light}，80 分以上為健康區間）")
+    if signals:
+        parts.append("扣分警訊：" + "、".join(signals))
+
+    return "；".join(parts) + "。"
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_cached_ai_analysis(
+    stock_name: str,
+    stock_symbol: str,
+    _indicator_summary: str,
+    _analyze,
+) -> dict:
+    """取得 AI 健檢結果，同一檔股票 24 小時內只消耗一次 Gemini API Token。
+
+    - 快取鍵僅取 stock_name / stock_symbol（純字串），符合「一天一檔一次」的預期
+    - 以底線前綴的 `_indicator_summary` 與 `_analyze` 會被 Streamlit 排除在快取鍵之外：
+      股價微動不會造成重複呼叫，且由 app.py 注入分析函式（無循環依賴）
+    - 分析函式丟出的例外不會被快取，下次按鈕會重新嘗試
+    """
+    return _analyze(stock_name, stock_symbol, _indicator_summary)
