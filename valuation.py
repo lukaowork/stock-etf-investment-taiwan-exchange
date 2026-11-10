@@ -53,6 +53,17 @@ SUPPORT_NEAR_PCT = 5.0    # ⭐ 亮點：缺口價距離估值下緣 ±5%
 
 MIN_PE_POINTS = 30        # 計算合理價所需的最少有效本益比樣本數
 
+# ---- EPS 動態基準切換器（Sidebar 下拉選單選項）----
+BASELINE_TTM = "1. 靜態 TTM 基準 (TTM EPS)"
+BASELINE_RUNRATE = "2. 單季季化基準 (Run-rate EPS)"
+BASELINE_REVENUE = "3. 月營收動態加權基準 (Monthly Revenue Dynamic EPS)"
+BASELINE_OPTIONS = (BASELINE_TTM, BASELINE_RUNRATE, BASELINE_REVENUE)
+
+# 經營槓桿 Alpha（僅月營收動態加權基準使用）
+ALPHA_MIN = 0.5
+ALPHA_MAX = 2.0
+ALPHA_DEFAULT = 1.0
+
 # 缺口分類 → 散佈圖顏色（普通缺口用中性灰）
 GAP_TYPE_COLORS = {
     GAP_TYPE_BREAKAWAY: "#27ae60",
@@ -182,36 +193,161 @@ def compute_pe_history(close: pd.Series, ttm_eps: pd.Series) -> pd.Series:
     return pe
 
 
-def compute_fair_value(pe_history: pd.Series, ttm_eps: pd.Series) -> dict | None:
-    """由歷史本益比序列推導合理價三線；樣本不足或無有效 TTM EPS 時回傳 None。
+def summarize_quarterly_eps(quarterly_eps) -> dict:
+    """整理逐季 EPS，回傳最新單季與近 4 季累積（TTM）資訊。
 
-    合理價   = TTM EPS × 歷史本益比中位數
-    估值下緣 = TTM EPS × 歷史本益比低點
-    估值上緣 = TTM EPS × 歷史本益比高點
+    回傳 {"latest_eps", "latest_date", "ttm_eps", "quarters"}；
+    資料不足時對應值為 None / 0。
+    """
+    result = {
+        "latest_eps": None,
+        "latest_date": "",
+        "ttm_eps": None,
+        "quarters": 0,
+    }
+    if not quarterly_eps:
+        return result
+
+    rows = []
+    for raw_date, raw_eps in quarterly_eps.items():
+        try:
+            ts = _naive_timestamp(raw_date)
+            val = float(raw_eps)
+        except Exception:  # 防禦性：外部財報日期格式異常時略過該筆
+            continue
+        if pd.isna(ts) or not np.isfinite(val):
+            continue
+        rows.append((ts, val))
+    if not rows:
+        return result
+
+    rows.sort(key=lambda item: item[0])
+    values = [item[1] for item in rows]
+    result["quarters"] = len(values)
+    result["latest_eps"] = values[-1]
+    result["latest_date"] = rows[-1][0].strftime("%Y-%m-%d")
+    if len(values) >= 4:
+        result["ttm_eps"] = float(sum(values[-4:]))
+    return result
+
+
+def compute_baseline_eps(
+    quarterly_eps,
+    baseline: str,
+    revenue_yoy_pct=None,
+    alpha: float = ALPHA_DEFAULT,
+) -> dict:
+    """依使用者選定的基準計算「動態 EPS (Calculated EPS)」。
+
+    1. TTM 基準       ：近四季累積已發布 EPS 總和
+    2. 單季季化基準   ：最新單季 EPS × 4
+    3. 月營收動態基準 ：最新單季 EPS × 4 × (1 + 近3個月營收YoY × Alpha)
+
+    說明：yfinance 未提供台股月營收，故以「最近一季（＝近 3 個月）營收 YoY」
+    作為動能係數；revenue_yoy_pct 傳入的是百分數（15.2 代表 15.2%）。
+
+    回傳 {"eps", "label", "display", "detail", "warning", "alpha"}；
+    無法計算時 eps 為 None。
+    """
+    stats = summarize_quarterly_eps(quarterly_eps)
+    latest = stats["latest_eps"]
+    label = str(baseline)
+    warning = ""
+    display = label
+
+    if baseline == BASELINE_TTM:
+        eps = stats["ttm_eps"]
+        display = "靜態 TTM 基準"
+        detail = (
+            f"近 4 季累積 EPS（樣本 {stats['quarters']} 季）"
+            if eps is not None
+            else "已發布季報不足 4 季，無法計算 TTM"
+        )
+
+    elif baseline == BASELINE_RUNRATE:
+        display = "單季季化基準 (Run-rate)"
+        if latest is None:
+            eps, detail = None, "查無已發布的單季 EPS"
+        else:
+            eps = latest * 4.0
+            detail = f"最新單季 EPS {latest:.2f} × 4 = {eps:.2f}"
+
+    elif baseline == BASELINE_REVENUE:
+        display = f"月營收動態加權 (Alpha={float(alpha):.1f})"
+        if latest is None:
+            eps, detail = None, "查無已發布的單季 EPS"
+        else:
+            run_rate = latest * 4.0
+            if revenue_yoy_pct is None:
+                yoy = 0.0
+                warning = (
+                    "⚠️ 未取得營收 YoY，暫以 0% 計算，"
+                    "動態加權效果等同單季季化基準。"
+                )
+            else:
+                yoy = float(revenue_yoy_pct) / 100.0
+            factor = 1.0 + yoy * float(alpha)
+            eps = run_rate * factor
+            detail = (
+                f"單季年化 {run_rate:.2f} × (1 + {yoy:+.2%} × {float(alpha):.2f}) "
+                f"= {eps:.2f}"
+            )
+
+    else:
+        eps, detail = None, "未知的 EPS 基準選項"
+
+    # 負值或非有限值的 EPS 無法定價，一律視為無法計算
+    if eps is not None and (not np.isfinite(eps) or eps <= 0):
+        eps = None
+        warning = f"{warning} ⚠️ 計算出的 EPS 非正值，無法進行估值。".strip()
+
+    return {
+        "eps": eps,
+        "label": label,
+        "display": display,
+        "detail": detail,
+        "warning": warning,
+        "alpha": float(alpha),
+        "revenue_yoy_pct": revenue_yoy_pct,
+        "quarters": stats["quarters"],
+        "latest_eps": latest,
+        "ttm_eps": stats["ttm_eps"],
+    }
+
+
+def compute_fair_value(pe_history: pd.Series, eps_value: float) -> dict | None:
+    """由歷史本益比序列 × 使用者選定的 EPS 基準推導合理價三線。
+
+    合理價   = Calculated EPS × 歷史本益比中位數
+    估值下緣 = Calculated EPS × 歷史本益比低點
+    估值上緣 = Calculated EPS × 歷史本益比高點
+
+    歷史本益比序列固定以「實際已發布的 TTM EPS」換算（反映市場真實給值）；
+    切換基準只替換分子的 EPS，符合規格「動態合理股價 = Calculated EPS × P/E Median」。
     """
     pe = pd.to_numeric(pe_history, errors="coerce").dropna()
     if len(pe) < MIN_PE_POINTS:
         return None
 
-    eps = pd.to_numeric(ttm_eps, errors="coerce").dropna()
-    if eps.empty:
+    try:
+        eps = float(eps_value)
+    except (TypeError, ValueError):
         return None
-    ttm = float(eps.iloc[-1])
-    if not np.isfinite(ttm) or ttm <= 0:
+    if not np.isfinite(eps) or eps <= 0:
         return None
 
     pe_median = float(pe.median())
     pe_min = float(pe.min())
     pe_max = float(pe.max())
     return {
-        "ttm_eps": ttm,
+        "eps": eps,
         "pe_median": pe_median,
         "pe_min": pe_min,
         "pe_max": pe_max,
         "pe_points": int(len(pe)),
-        "fair_value": ttm * pe_median,
-        "support": ttm * pe_min,
-        "resistance": ttm * pe_max,
+        "fair_value": eps * pe_median,
+        "support": eps * pe_min,
+        "resistance": eps * pe_max,
     }
 
 
@@ -498,9 +634,12 @@ def build_valuation_river_figure(
     gaps: pd.DataFrame,
     star_gaps: pd.DataFrame,
     title: str = "",
+    baseline_label: str = "",
 ) -> go.Figure:
     """上圖：K 線 + 未回補缺口色塊 + EPS 合理價三線 + ⭐ 亮點。
     下圖：歷史本益比走勢與中位數／低點／高點參考線。
+
+    baseline_label 會以副標形式標在圖表標題，顯示當前套用的 EPS 基準。
     """
     fig = make_subplots(
         rows=2,
@@ -627,8 +766,12 @@ def build_valuation_river_figure(
                 col=1,
             )
 
+    full_title = title or "K 線、EPS 合理價河流與本益比走勢"
+    if baseline_label:
+        full_title += f"<br><sup>當前估算基準：{baseline_label}</sup>"
+
     fig.update_layout(
-        title=title or "K 線、EPS 合理價河流與本益比走勢",
+        title=full_title,
         template="plotly_white",
         height=760,
         legend_title_text="圖例",

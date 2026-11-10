@@ -50,11 +50,17 @@ from market_data import (
     get_cached_ai_analysis,
 )
 from valuation import (
+    ALPHA_DEFAULT,
+    ALPHA_MAX,
+    ALPHA_MIN,
+    BASELINE_OPTIONS,
+    BASELINE_REVENUE,
     MIN_PE_POINTS,
     build_scatter_figure,
     build_ttm_eps_series,
     build_valuation_gap_table,
     build_valuation_river_figure,
+    compute_baseline_eps,
     compute_correlation,
     compute_fair_value,
     compute_pe_history,
@@ -292,6 +298,29 @@ selected_labels = st.sidebar.multiselect(
 time_frame = st.sidebar.selectbox("資料時間範圍：", ["近 3 個月", "近 6 個月", "近 1 年", "近 3 年"], index=2)
 days_map = {"近 3 個月": 90, "近 6 個月": 180, "近 1 年": 365, "近 3 年": 1095}
 start_date = datetime.now() - timedelta(days=days_map[time_frame])
+
+# ---------------------------------------------------------
+# EPS 動態基準切換器：供「EPS 價值與缺口對比」分頁切換基本面估算基準
+# ---------------------------------------------------------
+eps_baseline = st.sidebar.selectbox(
+    "選擇 EPS 估算基準：",
+    options=list(BASELINE_OPTIONS),
+    help=(
+        "TTM＝近 4 季累積已發布 EPS；單季季化＝最新單季 × 4；"
+        "月營收動態加權＝單季年化 × (1 + 近3個月營收YoY × Alpha)。"
+    ),
+)
+if eps_baseline == BASELINE_REVENUE:
+    eps_alpha = st.sidebar.slider(
+        "經營槓桿 Alpha",
+        min_value=ALPHA_MIN,
+        max_value=ALPHA_MAX,
+        value=ALPHA_DEFAULT,
+        step=0.1,
+        help="Alpha 越大，營收成長對 EPS 的放大效果越強。",
+    )
+else:
+    eps_alpha = ALPHA_DEFAULT
 
 
 # ---------------------------------------------------------
@@ -1838,21 +1867,38 @@ else:
             eps_quarterly = fund_val.get("eps_quarterly") or {}
             gaps_val = detect_gaps(df_val)
 
-            # 逐季 EPS → TTM EPS → 歷史本益比 → 合理價三線
+            # 歷史本益比固定以「實際 TTM EPS」換算，反映市場真實給值
             ttm_eps = build_ttm_eps_series(df_val.index, eps_quarterly)
             pe_history = compute_pe_history(df_val["Close"], ttm_eps)
-            fair = compute_fair_value(pe_history, ttm_eps)
+
+            # 依側邊欄選定的基準計算「動態 EPS (Calculated EPS)」
+            baseline = compute_baseline_eps(
+                quarterly_eps=eps_quarterly,
+                baseline=eps_baseline,
+                revenue_yoy_pct=fund_val.get("revenue_yoy"),
+                alpha=eps_alpha,
+            )
+            st.caption(
+                f"🧪 當前估算基準：{baseline['display']}｜{baseline['detail']}"
+            )
+
+            # 動態合理價 = Calculated EPS × 歷史本益比（中位數／低點／高點）
+            fair = compute_fair_value(pe_history, baseline["eps"])
 
             if fair is None:
                 st.warning(
-                    "⚠️ 無法取得足夠的歷史每股盈餘（EPS），"
-                    f"需至少 {MIN_PE_POINTS} 個有效本益比樣本才能計算合理價。"
+                    "⚠️ 目前基準無法建立合理價，請切換 EPS 基準或檢查財報資料。"
                 )
                 st.caption(
-                    "常見原因：ETF／指數型商品沒有 EPS、yfinance 未提供該股歷史財報，"
-                    "或上市時間過短。可改選個股（如 2330）測試。"
+                    f"套用基準：{baseline['label']}｜{baseline['detail']}。"
+                    f"另需至少 {MIN_PE_POINTS} 個有效本益比樣本；"
+                    "常見原因：ETF／指數型商品沒有 EPS、單季 EPS 為負值、"
+                    "yfinance 未提供該股歷史財報，或上市時間過短。"
                 )
             else:
+                if baseline["warning"]:
+                    st.warning(baseline["warning"])
+
                 gap_table = build_valuation_gap_table(
                     gaps_val, df_val["Close"], fair["fair_value"]
                 )
@@ -1891,8 +1937,9 @@ else:
                     "EPS 合理價 (Fair Value)",
                     f"{fair['fair_value']:.2f} 元",
                     help=(
-                        f"TTM EPS {fair['ttm_eps']:.2f} 元 × 歷史本益比中位數 "
+                        f"動態 EPS {fair['eps']:.2f} 元 × 歷史本益比中位數 "
                         f"{fair['pe_median']:.2f}（樣本 {fair['pe_points']} 個交易日）"
+                        f"；{baseline['detail']}"
                     ),
                 )
                 metric_col3.metric(
@@ -1960,6 +2007,7 @@ else:
                         gaps=gaps_val,
                         star_gaps=star_gaps,
                         title=f"{focus_label_val} K 線、EPS 合理價與本益比走勢",
+                        baseline_label=baseline["display"],
                     )
                     st.plotly_chart(fig_river, use_container_width=True)
                     if star_gaps.empty:
