@@ -22,11 +22,24 @@ GAP_DOWN = "向下跳空"
 GAP_FILLED = "已回補 (Filled)"
 GAP_UNFILLED = "未回補 (Unfilled)"
 
+# 缺口類型自動分類標籤（資料表顯示值與 UI 篩選器共用同一份字串）
+GAP_TYPE_BREAKAWAY = "突破缺口 (Breakaway)"
+GAP_TYPE_EXHAUSTION = "竭盡缺口 (Exhaustion)"
+GAP_TYPE_RUNAWAY = "逃逸/持續缺口 (Runaway)"
+GAP_TYPE_COMMON = "普通缺口 (Common)"
+GAP_TYPE_OPTIONS = (
+    GAP_TYPE_BREAKAWAY,
+    GAP_TYPE_EXHAUSTION,
+    GAP_TYPE_RUNAWAY,
+    GAP_TYPE_COMMON,
+)
+
 # 缺口表固定輸出型別：空表（無任何缺口）也維持相同 dtype，
 # 避免呼叫端對 object 型別執行數值比較時發生 TypeError
 GAP_DTYPES = {
     "日期": "string",
     "類型": "string",
+    "缺口分類": "string",
     "缺口底部": "float64",
     "缺口頂部": "float64",
     "缺口幅度(%)": "float64",
@@ -341,19 +354,52 @@ def build_alert_table(
     return pd.DataFrame(rows, columns=columns), skipped
 
 
+def _classify_gap(
+    vol_ratio: float,
+    ret_20: float,
+    box_high_20: float,
+    cur_low: float,
+) -> str:
+    """依量能與趨勢情境自動分類缺口，規則依序判斷、先符合者勝出。
+
+    1. 突破缺口：量能 > 1.8 倍 且 當日 Low > 過去 20 日最高（強勢突破箱型）
+    2. 竭盡缺口：過去 20 日累積漲幅 > 25% 且 量能 > 2.5 倍（高檔極致爆量）
+    3. 逃逸/持續缺口：多頭趨勢（20 日漲幅 > 8%）且 量能 > 1.2 倍
+    4. 普通缺口：其餘情形（規則 4 之「成交量未明顯放大」為描述性條件，
+       因分類僅有四種，故以最後的 else 收斂）
+
+    說明：NaN 參與比較一律回傳 False，因此前 20 個交易日或量能資料不足時
+    會自然落入「普通缺口」，不會拋出例外。
+    """
+    # 1) 突破缺口
+    if vol_ratio > 1.8 and cur_low > box_high_20:
+        return GAP_TYPE_BREAKAWAY
+    # 2) 竭盡缺口
+    if ret_20 > 25 and vol_ratio > 2.5:
+        return GAP_TYPE_EXHAUSTION
+    # 3) 逃逸/持續缺口
+    if ret_20 > 8 and vol_ratio > 1.2:
+        return GAP_TYPE_RUNAWAY
+    # 4) 普通缺口
+    return GAP_TYPE_COMMON
+
+
 def detect_gaps(df: pd.DataFrame, volume_window: int = 20) -> pd.DataFrame:
-    """偵測相鄰兩日 K 線的跳空缺口，並追蹤後續交易日是否已被回補。
+    """偵測相鄰兩日 K 線的跳空缺口，追蹤後續是否回補，並自動分類缺口類型。
 
     向上跳空：當日 Low > 前一日 High（缺口底部=前一日 High，缺口頂部=當日 Low）
     向下跳空：當日 High < 前一日 Low（缺口頂部=前一日 Low，缺口底部=當日 High）
     回補判定：向上缺口後續任一日 Low <= 缺口底部；向下缺口後續任一日 High >= 缺口頂部
+    類型判定：見 _classify_gap（突破 / 竭盡 / 逃逸 / 普通）
 
     回傳欄位（依日期升冪，供呼叫端排序）：
-    日期 / 類型 / 缺口底部 / 缺口頂部 / 缺口幅度(%) / 爆量倍數 / 是否回補 / 回補日期
+    日期 / 類型 / 缺口分類 / 缺口底部 / 缺口頂部 / 缺口幅度(%) /
+    爆量倍數 / 是否回補 / 回補日期
     """
     columns = [
         "日期",
         "類型",
+        "缺口分類",
         "缺口底部",
         "缺口頂部",
         "缺口幅度(%)",
@@ -376,6 +422,15 @@ def detect_gaps(df: pd.DataFrame, volume_window: int = 20) -> pd.DataFrame:
     else:
         volumes = pd.Series(dtype=float)
         volume_ma = pd.Series(dtype=float)
+
+    # 預先計算分類所需的逐日指標（20 日累積漲幅、20 日箱型高點）
+    # 注意：不使用 pct_change() 以避免 pandas 2.x 的 fill_method 棄用警告
+    if "Close" in data.columns:
+        closes = data["Close"].astype(float)
+        ret_20 = (closes / closes.shift(20) - 1.0) * 100
+    else:
+        ret_20 = pd.Series(float("nan"), index=data.index)
+    box_high_20 = highs.shift(1).rolling(20).max()
 
     dates = data.index
     records = []
@@ -417,10 +472,19 @@ def detect_gaps(df: pd.DataFrame, volume_window: int = 20) -> pd.DataFrame:
             if pd.notna(ma) and ma > 0:
                 vol_ratio = float(volumes.iloc[i]) / float(ma)
 
+        # 4. 缺口類型自動分類（量能倍數 × 趨勢情境）
+        gap_class = _classify_gap(
+            vol_ratio=vol_ratio,
+            ret_20=float(ret_20.iloc[i]),
+            box_high_20=float(box_high_20.iloc[i]),
+            cur_low=cur_low,
+        )
+
         records.append(
             {
                 "日期": pd.Timestamp(dates[i]).strftime("%Y-%m-%d"),
                 "類型": gap_type,
+                "缺口分類": gap_class,
                 "缺口底部": round(bottom, 2),
                 "缺口頂部": round(top, 2),
                 "缺口幅度(%)": round(pct, 2),

@@ -38,6 +38,9 @@ from gsheets_store import (
 )
 from market_data import (
     GAP_FILLED,
+    GAP_TYPE_BREAKAWAY,
+    GAP_TYPE_EXHAUSTION,
+    GAP_TYPE_OPTIONS,
     GAP_UNFILLED,
     GAP_UP,
     build_indicator_summary,
@@ -1619,17 +1622,31 @@ else:
                 ["全部缺口", f"僅看{GAP_UNFILLED}", f"僅看{GAP_FILLED}"],
             )
 
+        # 缺口類型多選篩選：預設全選＝全部；留空亦視為全部
+        gap_class_filter = st.multiselect(
+            "缺口類型篩選（Gap Type）",
+            options=list(GAP_TYPE_OPTIONS),
+            default=list(GAP_TYPE_OPTIONS),
+            help=(
+                "預設全選＝顯示全部分類；可只勾選「突破缺口」或「竭盡缺口」做單獨檢視。"
+                "留空＝顯示全部。"
+            ),
+        )
+
         if df_gap.empty or len(df_gap) < 2:
             st.warning("⚠️ 該標的 K 線資料不足，無法進行缺口分析。")
         else:
             all_gaps = detect_gaps(df_gap)
 
-            # 依最小幅度與回補狀態篩選
+            # 依最小幅度、回補狀態與缺口類型篩選
             filtered = all_gaps[all_gaps["缺口幅度(%)"] > min_gap_pct]
             if status_filter == f"僅看{GAP_UNFILLED}":
                 filtered = filtered[filtered["是否回補"] == GAP_UNFILLED]
             elif status_filter == f"僅看{GAP_FILLED}":
                 filtered = filtered[filtered["是否回補"] == GAP_FILLED]
+            # 未選取任何分類時視為「全部」，避免誤清空後畫面全空
+            if gap_class_filter:
+                filtered = filtered[filtered["缺口分類"].isin(gap_class_filter)]
 
             # 依日期降冪排序（最新在最上面）
             filtered = filtered.sort_values(
@@ -1640,12 +1657,22 @@ else:
             total_count = len(filtered)
             unfilled_count = int((filtered["是否回補"] == GAP_UNFILLED).sum())
             avg_gap = float(filtered["缺口幅度(%)"].mean()) if total_count else 0.0
+            breakaway_count = int(
+                (filtered["缺口分類"] == GAP_TYPE_BREAKAWAY).sum()
+            )
+            exhaustion_count = int(
+                (filtered["缺口分類"] == GAP_TYPE_EXHAUSTION).sum()
+            )
 
-            metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
-            metric_col1.metric("🕳️ 總缺口數", f"{total_count} 個")
-            metric_col2.metric("⚠️ 未回補缺口數", f"{unfilled_count} 個")
-            metric_col3.metric("🎯 已回補缺口數", f"{total_count - unfilled_count} 個")
-            metric_col4.metric("📊 平均缺口幅度", f"{avg_gap:.2f}%")
+            row1_col1, row1_col2, row1_col3 = st.columns(3)
+            row1_col1.metric("🕳️ 總缺口數", f"{total_count} 個")
+            row1_col2.metric("⚠️ 未回補缺口數", f"{unfilled_count} 個")
+            row1_col3.metric("🎯 已回補缺口數", f"{total_count - unfilled_count} 個")
+
+            row2_col1, row2_col2, row2_col3 = st.columns(3)
+            row2_col1.metric("🚀 突破缺口數量", f"{breakaway_count} 個")
+            row2_col2.metric("🚨 竭盡缺口警告數量", f"{exhaustion_count} 個")
+            row2_col3.metric("📊 平均缺口幅度", f"{avg_gap:.2f}%")
 
             if filtered.empty:
                 st.info("✅ 目前篩選條件下沒有符合的缺口。")
@@ -1658,6 +1685,9 @@ else:
                     column_config={
                         "日期": st.column_config.TextColumn("日期", width="small"),
                         "類型": st.column_config.TextColumn("類型", width="small"),
+                        "缺口分類": st.column_config.TextColumn(
+                            "缺口分類", width="medium"
+                        ),
                         "缺口底部": st.column_config.NumberColumn(
                             "缺口底部", format="%.2f"
                         ),
