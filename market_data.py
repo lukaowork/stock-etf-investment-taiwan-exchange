@@ -16,6 +16,25 @@ REQUIRED_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 # 相對強度基準指數（agents.md 命名範例 ^TWII）
 DEFAULT_BENCHMARK = "^TWII"
 
+# 缺口分析狀態常數（供 UI 與資料表共用，避免字串散落各處）
+GAP_UP = "向上跳空"
+GAP_DOWN = "向下跳空"
+GAP_FILLED = "已回補 (Filled)"
+GAP_UNFILLED = "未回補 (Unfilled)"
+
+# 缺口表固定輸出型別：空表（無任何缺口）也維持相同 dtype，
+# 避免呼叫端對 object 型別執行數值比較時發生 TypeError
+GAP_DTYPES = {
+    "日期": "string",
+    "類型": "string",
+    "缺口底部": "float64",
+    "缺口頂部": "float64",
+    "缺口幅度(%)": "float64",
+    "爆量倍數": "float64",
+    "是否回補": "string",
+    "回補日期": "string",
+}
+
 
 def get_symbol_frame(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     """從 yf.download 的回傳值取出單一標的的 OHLCV 資料；失敗回傳空 DataFrame。"""
@@ -320,6 +339,98 @@ def build_alert_table(
         "警訊",
     ]
     return pd.DataFrame(rows, columns=columns), skipped
+
+
+def detect_gaps(df: pd.DataFrame, volume_window: int = 20) -> pd.DataFrame:
+    """偵測相鄰兩日 K 線的跳空缺口，並追蹤後續交易日是否已被回補。
+
+    向上跳空：當日 Low > 前一日 High（缺口底部=前一日 High，缺口頂部=當日 Low）
+    向下跳空：當日 High < 前一日 Low（缺口頂部=前一日 Low，缺口底部=當日 High）
+    回補判定：向上缺口後續任一日 Low <= 缺口底部；向下缺口後續任一日 High >= 缺口頂部
+
+    回傳欄位（依日期升冪，供呼叫端排序）：
+    日期 / 類型 / 缺口底部 / 缺口頂部 / 缺口幅度(%) / 爆量倍數 / 是否回補 / 回補日期
+    """
+    columns = [
+        "日期",
+        "類型",
+        "缺口底部",
+        "缺口頂部",
+        "缺口幅度(%)",
+        "爆量倍數",
+        "是否回補",
+        "回補日期",
+    ]
+    if df is None or df.empty or len(df) < 2:
+        return pd.DataFrame(columns=columns).astype(GAP_DTYPES)
+
+    data = df.dropna(subset=["High", "Low"])
+    if len(data) < 2:
+        return pd.DataFrame(columns=columns).astype(GAP_DTYPES)
+
+    highs = data["High"].astype(float)
+    lows = data["Low"].astype(float)
+    if "Volume" in data.columns:
+        volumes = data["Volume"].astype(float)
+        volume_ma = volumes.rolling(volume_window).mean()
+    else:
+        volumes = pd.Series(dtype=float)
+        volume_ma = pd.Series(dtype=float)
+
+    dates = data.index
+    records = []
+
+    for i in range(1, len(data)):
+        prev_high = float(highs.iloc[i - 1])
+        prev_low = float(lows.iloc[i - 1])
+        cur_high = float(highs.iloc[i])
+        cur_low = float(lows.iloc[i])
+
+        # 1. 缺口判定
+        if cur_low > prev_high:
+            gap_type = GAP_UP
+            bottom, top = prev_high, cur_low
+            pct = (cur_low - prev_high) / prev_high * 100 if prev_high else float("nan")
+        elif cur_high < prev_low:
+            gap_type = GAP_DOWN
+            bottom, top = cur_high, prev_low
+            pct = (prev_low - cur_high) / prev_low * 100 if prev_low else float("nan")
+        else:
+            continue
+
+        # 2. 追蹤後續交易日是否回補（只看 i 之後的交易日）
+        fill_date = "N/A"
+        filled = False
+        for j in range(i + 1, len(data)):
+            if gap_type == GAP_UP and float(lows.iloc[j]) <= bottom:
+                filled = True
+            elif gap_type == GAP_DOWN and float(highs.iloc[j]) >= top:
+                filled = True
+            if filled:
+                fill_date = pd.Timestamp(dates[j]).strftime("%Y-%m-%d")
+                break
+
+        # 3. 當日量能倍數（當日量 / 20 日均量）
+        vol_ratio = float("nan")
+        if len(volume_ma) > i:
+            ma = volume_ma.iloc[i]
+            if pd.notna(ma) and ma > 0:
+                vol_ratio = float(volumes.iloc[i]) / float(ma)
+
+        records.append(
+            {
+                "日期": pd.Timestamp(dates[i]).strftime("%Y-%m-%d"),
+                "類型": gap_type,
+                "缺口底部": round(bottom, 2),
+                "缺口頂部": round(top, 2),
+                "缺口幅度(%)": round(pct, 2),
+                "爆量倍數": round(vol_ratio, 2),
+                "是否回補": GAP_FILLED if filled else GAP_UNFILLED,
+                "回補日期": fill_date,
+            }
+        )
+
+    return pd.DataFrame(records, columns=columns).astype(GAP_DTYPES)
 
 
 def build_indicator_summary(

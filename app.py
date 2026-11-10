@@ -37,7 +37,11 @@ from gsheets_store import (
     load_watchlist_stocks,
 )
 from market_data import (
+    GAP_FILLED,
+    GAP_UNFILLED,
+    GAP_UP,
     build_indicator_summary,
+    detect_gaps,
     download_frames,
     fetch_benchmark_close,
     get_cached_ai_analysis,
@@ -1333,14 +1337,15 @@ else:
     }
 
 
-    # 主畫面 6 大分頁
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    # 主畫面 7 大分頁
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "📊 核心觀察",
         "📈 K線與技術分析",
         "⚖️ 多標的走勢對比",
         "📋 歷史數據明細",
         "🤖 AI 股市三健檢與動態分析",
         "📦 庫存帳本",
+        "🔍 K線缺口分析",
     ])
 
     # -----------------------------------------------------
@@ -1578,3 +1583,156 @@ else:
     # -----------------------------------------------------
     with tab6:
         render_transactions_tab()
+
+    # -----------------------------------------------------
+    # Tab 7: K 線缺口分析 (Gap Analysis)
+    # -----------------------------------------------------
+    with tab7:
+        st.subheader("🔍 K 線缺口分析（Gap Analysis）")
+        st.caption(
+            "跳空缺口判定：向上缺口＝當日 Low > 前一日 High；"
+            "向下缺口＝當日 High < 前一日 Low。"
+            "缺口於後續交易日被穿越即判定為已回補。"
+        )
+
+        focus_label_gap = st.selectbox(
+            "選擇要分析缺口的標的：",
+            selected_labels,
+            key="gap_select",
+        )
+        df_gap = frames.get(focus_label_gap, pd.DataFrame())
+
+        # 頂部篩選器：最小幅度（過濾噪訊）＋ 回補狀態
+        filter_col1, filter_col2 = st.columns([1, 1])
+        with filter_col1:
+            min_gap_pct = st.slider(
+                "缺口最小幅度（%）",
+                min_value=0.0,
+                max_value=5.0,
+                value=0.5,
+                step=0.1,
+                help="過濾小幅噪訊，預設只顯示幅度大於 0.5% 的缺口。",
+            )
+        with filter_col2:
+            status_filter = st.selectbox(
+                "回補狀態篩選",
+                ["全部缺口", f"僅看{GAP_UNFILLED}", f"僅看{GAP_FILLED}"],
+            )
+
+        if df_gap.empty or len(df_gap) < 2:
+            st.warning("⚠️ 該標的 K 線資料不足，無法進行缺口分析。")
+        else:
+            all_gaps = detect_gaps(df_gap)
+
+            # 依最小幅度與回補狀態篩選
+            filtered = all_gaps[all_gaps["缺口幅度(%)"] > min_gap_pct]
+            if status_filter == f"僅看{GAP_UNFILLED}":
+                filtered = filtered[filtered["是否回補"] == GAP_UNFILLED]
+            elif status_filter == f"僅看{GAP_FILLED}":
+                filtered = filtered[filtered["是否回補"] == GAP_FILLED]
+
+            # 依日期降冪排序（最新在最上面）
+            filtered = filtered.sort_values(
+                "日期", ascending=False
+            ).reset_index(drop=True)
+
+            # 數據指標卡片
+            total_count = len(filtered)
+            unfilled_count = int((filtered["是否回補"] == GAP_UNFILLED).sum())
+            avg_gap = float(filtered["缺口幅度(%)"].mean()) if total_count else 0.0
+
+            metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+            metric_col1.metric("🕳️ 總缺口數", f"{total_count} 個")
+            metric_col2.metric("⚠️ 未回補缺口數", f"{unfilled_count} 個")
+            metric_col3.metric("🎯 已回補缺口數", f"{total_count - unfilled_count} 個")
+            metric_col4.metric("📊 平均缺口幅度", f"{avg_gap:.2f}%")
+
+            if filtered.empty:
+                st.info("✅ 目前篩選條件下沒有符合的缺口。")
+            else:
+                st.markdown("#### 📋 歷史缺口明細")
+                st.dataframe(
+                    filtered,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "日期": st.column_config.TextColumn("日期", width="small"),
+                        "類型": st.column_config.TextColumn("類型", width="small"),
+                        "缺口底部": st.column_config.NumberColumn(
+                            "缺口底部", format="%.2f"
+                        ),
+                        "缺口頂部": st.column_config.NumberColumn(
+                            "缺口頂部", format="%.2f"
+                        ),
+                        "缺口幅度(%)": st.column_config.NumberColumn(
+                            "缺口幅度(%)", format="%.2f"
+                        ),
+                        "爆量倍數": st.column_config.NumberColumn(
+                            "爆量倍數",
+                            format="%.2f",
+                            help="當日成交量 ÷ 20 日均量",
+                        ),
+                        "是否回補": st.column_config.TextColumn(
+                            "是否回補", width="medium"
+                        ),
+                        "回補日期": st.column_config.TextColumn(
+                            "回補日期", width="small"
+                        ),
+                    },
+                )
+                st.caption(
+                    "📎 資料依日期降冪排序；「回補日期」為 N/A 代表尚未回補。"
+                )
+
+                # -------------------------------------------------
+                # K 線圖：未回補缺口以色塊標示支撐／壓力區
+                # -------------------------------------------------
+                st.markdown("#### 📈 未回補缺口支撐／壓力區")
+                fig_gap = go.Figure()
+                fig_gap.add_trace(go.Candlestick(
+                    x=df_gap.index,
+                    open=df_gap["Open"],
+                    high=df_gap["High"],
+                    low=df_gap["Low"],
+                    close=df_gap["Close"],
+                    name=focus_label_gap,
+                ))
+
+                # 半透明色塊：向上缺口＝綠（支撐）、向下缺口＝紅（壓力）
+                last_ts = pd.Timestamp(df_gap.index[-1])
+                unfilled_rows = filtered[filtered["是否回補"] == GAP_UNFILLED]
+                for _, row in unfilled_rows.iterrows():
+                    gap_start = pd.Timestamp(row["日期"])
+                    gap_end = (
+                        last_ts
+                        if last_ts > gap_start
+                        else gap_start + pd.Timedelta(days=3)
+                    )
+                    is_up = row["類型"] == GAP_UP
+                    fig_gap.add_vrect(
+                        x0=gap_start,
+                        x1=gap_end,
+                        fillcolor=(
+                            "rgba(46, 204, 113, 0.18)"
+                            if is_up
+                            else "rgba(229, 72, 77, 0.18)"
+                        ),
+                        line_width=0,
+                        layer="below",
+                    )
+
+                fig_gap.update_layout(
+                    title=f"{focus_label_gap} K 線與未回補缺口區間",
+                    xaxis_title="日期",
+                    yaxis_title="價格 (TWD)",
+                    xaxis_rangeslider_visible=False,
+                    height=520,
+                    template="plotly_white",
+                )
+                st.plotly_chart(fig_gap, use_container_width=True)
+
+                st.caption(
+                    "🟢 半透明綠色區塊＝向上跳空缺口（動態支撐區，缺口底部為前一日 High）；"
+                    "🔴 半透明紅色區塊＝向下跳空缺口（動態壓力區，缺口頂部為前一日 Low）。"
+                    "色塊僅標示「未回補」缺口，已回補缺口請見上方明細表。"
+                )
