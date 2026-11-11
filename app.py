@@ -47,7 +47,21 @@ from market_data import (
     detect_gaps,
     download_frames,
     fetch_benchmark_close,
+    fetch_treasury_yield,
     get_cached_ai_analysis,
+)
+from health_check import (
+    build_health_report,
+    build_radar_figure,
+    build_summary_text,
+    compute_valuation_metrics,
+)
+from twse_data import (
+    fetch_margin_usage,
+    fetch_market_valuation,
+    lookup_margin_usage,
+    market_median_pe,
+    market_percentile,
 )
 from valuation import (
     ALPHA_DEFAULT,
@@ -392,6 +406,11 @@ def fetch_fundamentals(symbol: str) -> dict:
       - avg_eps_4q    ：近 4 季平均 EPS（供模型推估基準）
       - eps_quarterly ：逐季 EPS 序列 {公告日: 該季 EPS}（供估值分頁算 TTM 與本益比）
       - revenue_yoy   ：最近一季營收年增率 YoY %
+      - revenue_q / cogs_q / operating_income_q：逐季財報 {財期末: 金額}
+        （供四層健檢計算 DIO 與 Price vs. Volume 拆解）
+      - inventory_q   ：逐季存貨 {財期末: 金額}
+      - cfo_ttm / net_income_ttm：近 4 季營業現金流與淨利（獲利真實度）
+      - sector / industry：yfinance 產業分類
     """
     data = {
         "text": "",
@@ -402,6 +421,14 @@ def fetch_fundamentals(symbol: str) -> dict:
         "avg_eps_4q": None,
         "revenue_yoy": None,
         "eps_quarterly": {},
+        "revenue_q": {},
+        "cogs_q": {},
+        "operating_income_q": {},
+        "inventory_q": {},
+        "cfo_ttm": None,
+        "net_income_ttm": None,
+        "sector": None,
+        "industry": None,
     }
 
     try:
@@ -509,6 +536,86 @@ def fetch_fundamentals(symbol: str) -> dict:
                         fallback_eps[str(pd.Timestamp(period_end).date())] = float(num)
                     if len(fallback_eps) >= 4:
                         data["eps_quarterly"] = fallback_eps
+
+            # 逐季營收／銷貨成本／營業利益（四層健檢：DIO 與 Price vs. Volume 拆解）
+            for field, names in (
+                ("revenue_q", ("total revenue",)),
+                ("cogs_q", ("cost of revenue", "reconciled cost of revenue")),
+                ("operating_income_q", ("operating income",)),
+            ):
+                row = next((idx[name] for name in names if name in idx), None)
+                if row is None:
+                    continue
+                series = stmt.loc[row].dropna()
+                for period, val in series.items():
+                    num = _to_number(val)
+                    if num is None or pd.isna(period):
+                        continue
+                    data[field][str(pd.Timestamp(period).date())] = float(num)
+
+            # 近 4 季淨利（獲利真實度 CFO / 淨利 的分母）
+            ni_row = idx.get("net income") or idx.get("net income common stockholders")
+            if ni_row is not None:
+                ni_series = stmt.loc[ni_row].dropna()
+                ni_values = [
+                    v
+                    for v in (_to_number(v) for v in ni_series.iloc[:4])
+                    if v is not None
+                ]
+                if len(ni_values) >= 4:
+                    data["net_income_ttm"] = float(sum(ni_values))
+    except Exception:
+        pass
+
+    # --- D. quarterly_cashflow：營業活動現金流量（獲利真實度 CFO） ---
+    try:
+        cashflow = ticker.quarterly_cashflow
+        if cashflow is not None and hasattr(cashflow, "empty") and not cashflow.empty:
+            idx_c = {str(i).lower(): i for i in cashflow.index}
+            cfo_row = next(
+                (
+                    idx_c[name]
+                    for name in (
+                        "operating cash flow",
+                        "total cash from operating activities",
+                        "cash flow from operating activities",
+                    )
+                    if name in idx_c
+                ),
+                None,
+            )
+            if cfo_row is not None:
+                series = cashflow.loc[cfo_row].dropna()
+                values = [
+                    v for v in (_to_number(v) for v in series.iloc[:4]) if v is not None
+                ]
+                if len(values) >= 4:
+                    data["cfo_ttm"] = float(sum(values))
+    except Exception:
+        pass
+
+    # --- E. quarterly_balance_sheet：存貨（產業庫存天數 DIO） ---
+    try:
+        balance = ticker.quarterly_balance_sheet
+        if balance is not None and hasattr(balance, "empty") and not balance.empty:
+            idx_b = {str(i).lower(): i for i in balance.index}
+            inv_row = idx_b.get("inventory")
+            if inv_row is not None:
+                series = balance.loc[inv_row].dropna()
+                for period, val in series.items():
+                    num = _to_number(val)
+                    if num is None or pd.isna(period):
+                        continue
+                    data["inventory_q"][str(pd.Timestamp(period).date())] = float(num)
+    except Exception:
+        pass
+
+    # --- F. info：產業分類（四層健檢的產業風向層顯示用） ---
+    try:
+        info = ticker.info
+        if isinstance(info, dict):
+            data["sector"] = info.get("sector") or None
+            data["industry"] = info.get("industry") or None
     except Exception:
         pass
 
@@ -1381,6 +1488,184 @@ def render_transactions_tab() -> None:
     )
 
 
+# ---------------------------------------------------------
+# 四層全方位健檢：儀表板 + 雷達圖 + 逐層展開詳情（UI 層）
+# ---------------------------------------------------------
+def render_health_check(
+    df: pd.DataFrame,
+    label: str,
+    symbol: str,
+    benchmark_close: pd.Series,
+    start_date,
+    eps_baseline: str,
+    eps_alpha: float,
+) -> None:
+    """渲染四層全方位健檢 (4-Layer Corporate Health Check)。
+
+    資料流：yfinance 財報／行情 + TWSE OpenAPI（融資、本益比、股價淨值比）
+          + 美債 10Y（無風險利率代理）
+          → health_check.build_health_report 純計算
+          → 本函式只負責 UI 呈現（SRP 解耦）。
+
+    任一資料源失敗時，health_check 會把該子項排除計分，
+    本函式則以 N/A 欄位呈現，不會中斷整個分頁。
+    """
+    # ---- 1. 原始資料（皆有 @st.cache_data 快取與防禦式降級）----
+    with st.spinner("載入四層健檢資料..."):
+        fund = fetch_fundamentals(symbol) or {}
+        margin_frame = fetch_margin_usage()
+        market_frame = fetch_market_valuation()
+        treasury = fetch_treasury_yield(start_date.strftime("%Y-%m-%d"))
+
+    code = str(symbol).split(".")[0]
+    margin_usage = lookup_margin_usage(margin_frame, code)
+    pb_percentile = market_percentile(market_frame, code, "PBratio")
+
+    # ---- 2. 估值快照（與「EPS 價值與缺口相關性」分頁共用同一套基準）----
+    valuation = {
+        "price": None,
+        "ttm_eps": None,
+        "pe_now": None,
+        "pe_percentile": None,
+        "fair_value": None,
+        "vgr": None,
+        "pb_percentile": pb_percentile,
+    }
+    if df is not None and not df.empty and "Close" in df.columns:
+        close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+        if len(close) > 0:
+            price = float(close.iloc[-1])
+            eps_quarterly = fund.get("eps_quarterly") or {}
+            baseline = compute_baseline_eps(
+                quarterly_eps=eps_quarterly,
+                baseline=eps_baseline,
+                revenue_yoy_pct=fund.get("revenue_yoy"),
+                alpha=eps_alpha,
+            )
+            # 歷史本益比固定以實際 TTM EPS 換算；合理價則套用側邊欄選定的基準
+            ttm_series = build_ttm_eps_series(close.index, eps_quarterly)
+            pe_history = compute_pe_history(close, ttm_series)
+            fair = compute_fair_value(pe_history, baseline["eps"])
+            valuation = compute_valuation_metrics(
+                price=price,
+                ttm_eps=float(ttm_series.iloc[-1]) if len(ttm_series) else None,
+                pe_history=pe_history,
+                fair=fair,
+                pb_percentile=pb_percentile,
+            )
+
+    # ---- 3. 四層純計算 ----
+    report = build_health_report(
+        benchmark_close=benchmark_close,
+        treasury_yield=treasury,
+        market_median_pe=market_median_pe(market_frame),
+        fund=fund,
+        df=df,
+        margin_usage=margin_usage,
+        valuation=valuation,
+    )
+    layers = report["layers"]
+    agg = report["agg"]
+    total = agg.get("total")
+    vetoes = agg.get("vetoes", [])
+
+    # ---- A. 健檢總結儀表板 ----
+    st.markdown("#### 🩺 健檢總結儀表板")
+    st.caption(
+        "四層權重：🌐 總經 **15%** ｜ 🏭 產業 **25%** ｜ 💰 籌碼 **25%** ｜ "
+        "🏦 財務 **35%**　·　評分 0–100，**80 分以上為健康區間**"
+    )
+
+    col_score, col_grade, col_veto = st.columns(3)
+    col_score.metric(
+        "綜合健康評分",
+        "N/A" if total is None else f"{total:.1f} 分",
+        help="四層加權平均；資料不足的層不計入，其權重重新分配到其餘層。",
+    )
+    col_grade.metric(
+        "健康等級",
+        f"{agg.get('icon', '')} {agg.get('grade', '')}",
+        help="🟢 ≥80 綠燈（健康）｜ 🟡 60–79 黃燈（觀察）｜ 🔴 <60 紅燈（警戒）",
+    )
+    col_veto.metric(
+        "一票否決",
+        f"{len(vetoes)} 項" if vetoes else "無",
+        delta="🚨 有否決" if vetoes else "✅ 無",
+        delta_color="normal" if vetoes else "off",
+        help="任一層觸發一票否決時，該層分數封頂 40 分並顯示 🚨 警示。",
+    )
+
+    for text in vetoes:
+        st.error(text)
+
+    # ---- 四層健檢分析總結 ----
+    st.info(build_summary_text(layers, agg))
+
+    # ---- B. 四層蜘蛛雷達圖 ＋ 各層分數 ----
+    left, right = st.columns([1.15, 1])
+    with left:
+        st.plotly_chart(
+            build_radar_figure(layers),
+            use_container_width=True,
+            key="health_radar",
+        )
+    with right:
+        st.markdown("**各層得分**")
+        for item in layers:
+            score = item.get("score")
+            if score is None:
+                st.warning(
+                    f"{item['icon']} {item['name']}：資料不足，本層不計分"
+                )
+                continue
+            st.progress(
+                max(0.0, min(1.0, score / 100.0)),
+                text=(
+                    f"{item['icon']} {item['name']}（{item['weight'] * 100:.0f}%）"
+                    f"　{score:.1f} 分 — {item['verdict']}"
+                ),
+            )
+
+    # ---- C. 逐層展開診斷詳情 ----
+    st.markdown("#### 🔬 逐層展開診斷詳情")
+    for item in layers:
+        score = item.get("score")
+        score_text = "N/A" if score is None else f"{score:.1f}"
+        with st.expander(
+            f"{item['icon']} {item['name']}（權重 {item['weight'] * 100:.0f}%）"
+            f" — {score_text} 分｜{item['verdict']}",
+            expanded=False,
+        ):
+            metrics = item.get("metrics") or []
+            for row_start in range(0, len(metrics), 4):
+                row = metrics[row_start:row_start + 4]
+                cols = st.columns(len(row))
+                for col, metric in zip(cols, row):
+                    with col:
+                        st.metric(
+                            metric.get("label", ""),
+                            metric.get("value", ""),
+                            delta=metric.get("delta"),
+                            help=metric.get("help"),
+                        )
+            st.markdown(f"**🧠 健檢評語**：{item.get('narrative', '')}")
+            st.markdown(f"**🧭 建議**：{item.get('advice', '')}")
+            for veto_text in item.get("vetoes", []):
+                st.error(veto_text)
+            for note in item.get("notes", []):
+                st.caption(f"ℹ️ {note}")
+
+    st.caption(
+        "📎 資料來源：yfinance（^TWII 大盤、^TNX 美債 10Y、個股三大財報）、"
+        "台灣證交所 OpenAPI（MI_MARGN 融資餘額、BWIBBU_d 本益比與股價淨值比）。"
+        "個股主力／外資／投信連續買賣超天數無免費 API，已以 A/D 累積線連續天數代理；"
+        "台灣公債殖利率無公開 API，無風險利率採美債 10Y 代理。"
+        "本模組為規則計算結果，僅供研究參考，非投資建議。"
+    )
+    if label:
+        st.caption(f"📌 本輪健檢標的：{label}（{symbol}）｜ EPS 基準：{eps_baseline}")
+
+
 if not selected_labels:
     st.warning("👈 請於左側邊欄選擇至少一檔股票或 ETF 開始載入數據。")
     # 未選擇標的時，仍可查看庫存帳本
@@ -1416,7 +1701,7 @@ else:
         "📈 K線與技術分析",
         "⚖️ 多標的走勢對比",
         "📋 歷史數據明細",
-        "🤖 AI 股市三健檢與動態分析",
+        "🏥 四層健檢與 AI 三健檢",
         "📦 庫存帳本",
         "🔍 K線缺口分析",
         "🧮 EPS價值與缺口相關性",
@@ -1560,24 +1845,38 @@ else:
             )
 
     # -----------------------------------------------------
-    # Tab 5: AI 股市三健檢與動態分析 (Gemini)
+    # Tab 5: 四層全方位健檢（上）＋ AI 股市三健檢 (Gemini)（下）
     # -----------------------------------------------------
     with tab5:
-        st.subheader("🤖 AI 股市三健檢與動態分析")
+        st.subheader("🏥 四層全方位健檢 (4-Layer Corporate Health Check)")
 
         if "ai_results" not in st.session_state:
             st.session_state["ai_results"] = {}
 
-        api_key = get_gemini_api_key()
-        ai_ready = GENAI_AVAILABLE and bool(api_key)
-
-        # 頂部：股票選擇框
+        # 頂部：股票選擇框（四層健檢與下方 AI 三健檢共用同一標的）
         focus_label_ai = st.selectbox(
             "選擇要分析的自選股標的：",
             selected_labels,
             key="ai_select",
         )
         focus_sym_ai = STOCK_DICT[focus_label_ai]
+
+        # ---------- 四層健檢儀表板（規則計算，切換標的即時更新）----------
+        render_health_check(
+            df=frames.get(focus_label_ai),
+            label=focus_label_ai,
+            symbol=focus_sym_ai,
+            benchmark_close=fetch_benchmark_close(start_date.strftime("%Y-%m-%d")),
+            start_date=start_date,
+            eps_baseline=eps_baseline,
+            eps_alpha=eps_alpha,
+        )
+
+        st.divider()
+        st.subheader("🤖 AI 股市三健檢與動態分析")
+
+        api_key = get_gemini_api_key()
+        ai_ready = GENAI_AVAILABLE and bool(api_key)
 
         # 環境檢查提示
         if not GENAI_AVAILABLE:

@@ -180,6 +180,29 @@ def fetch_benchmark_close(start) -> pd.Series:
     return frame["Close"].dropna()
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_treasury_yield(start) -> pd.Series:
+    """美國 10 年期公債殖利率 (%)，作為無風險利率代理（快取 1 小時）。
+
+    台灣公債殖利率沒有公開 API，故以美債 10Y (^TNX) 代理 —— 台股折現率
+    高度連動 Fed 政策利率，適合作為市場風險溢酬 (ERP) 的無風險利率 leg。
+
+    ^TNX 若以「殖利率 ×10」報價（值 > 20）會自動除以 10 正規化。
+    抓取失敗回傳空序列，由呼叫端降級為「ERP 無法計算」。
+    """
+    frames = download_frames(["^TNX"], start=start)
+    frame = frames.get("^TNX")
+    if frame is None or frame.empty or "Close" not in frame.columns:
+        return pd.Series(dtype=float)
+
+    series = pd.to_numeric(frame["Close"], errors="coerce").dropna()
+    if series.empty:
+        return pd.Series(dtype=float)
+    if float(series.iloc[-1]) > 20:
+        series = series / 10.0
+    return series
+
+
 def compute_volume_zscore(volume: pd.Series, window: int = 20) -> pd.Series:
     """量能 Z-Score = (Volume - MA_window) / Std_window。
 
