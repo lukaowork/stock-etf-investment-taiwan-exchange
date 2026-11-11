@@ -43,7 +43,6 @@ VR_SURGE = 1.5              # 爆量倍數門檻（今日量 / 20 日均量）
 
 # 財務層門檻
 CFO_VETO_RATIO = 0.30       # CFO / 淨利低於此值 → 獲利真實度一票否決
-VGR_VETO = 40.0             # 價值偏差率過高 → 估值泡沫一票否決
 REV_COLLAPSE = -20.0        # 營收年增率崩落門檻（%）
 DIO_SWELL = 15.0            # 庫存天數惡化門檻（天）
 
@@ -54,7 +53,6 @@ VETO_MARGIN = "🚨 警告！融資使用率逼近上限，籌碼隨時可能鬆
 VETO_MARGIN_DUMP = "🚨 警告！高檔爆量下跌且融資偏高，出貨疑慮（一票否決）"
 VETO_MACRO = "🚨 警告！無風險利率快速上修且大盤跌破 20MA，總經逆風（一票否決）"
 VETO_INDUSTRY = "🚨 警告！營收大幅衰退且庫存天數攀升，需求端疑慮（一票否決）"
-VETO_VGR = "🚨 警告！現價明顯高於合理價，估值泡沫風險（一票否決）"
 
 
 # ---------------------------------------------------------------------------
@@ -373,10 +371,10 @@ def compute_valuation_metrics(
     fair: dict,
     pb_percentile=None,
 ) -> dict:
-    """彙整估值安全度所需的四個數值。
+    """彙整估值安全度所需的數值。
 
     - pe_now / pe_percentile：目前股價對應的本益比及其在「歷史分布」的百分位
-    - vgr：現價相對合理價的價值偏差率 (%)
+    - fair_value：動態 EPS × 歷史本益比中位數（僅供參考，不計分、不與缺口比對）
     - pb_percentile：個股 P/B 在「全市場橫斷面」的百分位（TWSE 資料）
 
     回傳 dict；任一元件缺漏時對應值為 None。
@@ -387,7 +385,6 @@ def compute_valuation_metrics(
         "pe_now": None,
         "pe_percentile": None,
         "fair_value": None,
-        "vgr": None,
         "pb_percentile": _num(pb_percentile),
     }
 
@@ -403,10 +400,7 @@ def compute_valuation_metrics(
         out["pe_percentile"] = float((pe <= out["pe_now"]).mean() * 100.0)
 
     if isinstance(fair, dict):
-        fv = _num(fair.get("fair_value"))
-        out["fair_value"] = fv
-        if fv is not None and fv > 0 and out["price"] is not None:
-            out["vgr"] = (out["price"] - fv) / fv * 100.0
+        out["fair_value"] = _num(fair.get("fair_value"))
     return out
 
 
@@ -915,7 +909,7 @@ def score_financial(fund: dict, valuation: dict) -> dict:
 
     診斷指標（三項等權）：
       1. 獲利真實度：CFO / 淨利比率（預防 EPS 灌水）
-      2. 估值安全度：價值偏差率 VGR 與 歷史 P/E / P/B 分位數
+      2. 估值安全度：歷史 P/E 分位與全市場 P/B 分位
       3. 經營槓桿敏感度：Price vs. Volume 拆解
     """
     fund = fund if isinstance(fund, dict) else {}
@@ -968,29 +962,19 @@ def score_financial(fund: dict, valuation: dict) -> dict:
         })
         notes.append("缺少 CFO 或淨利資料，獲利真實度無法計算。")
 
-    # ---- 2. 估值安全度：VGR + P/E 分位 + P/B 分位 ----
-    vgr = _num(valuation.get("vgr"))
+    # ---- 2. 估值安全度：歷史 P/E 分位 + 全市場 P/B 分位 ----
     pe_pct = _num(valuation.get("pe_percentile"))
     pb_pct = _num(valuation.get("pb_percentile"))
     val_subs = []
 
-    if vgr is not None:
-        # VGR 越低（相對合理價越便宜）分數越高
-        val_subs.append(_clip(50.0 - 1.6 * vgr, 5.0, 100.0))
-        metrics.append({
-            "label": "價值偏差率 VGR",
-            "value": f"{vgr:+.1f}%",
-            "delta": f"合理價 {_num(valuation.get('fair_value')):,.2f} 元"
-            if _num(valuation.get("fair_value")) is not None else None,
-            "help": "現價相對合理價的偏差；正值代表高於合理價（相對偏貴）。",
-        })
-    else:
-        metrics.append({
-            "label": "價值偏差率 VGR",
-            "value": "N/A",
-            "delta": None,
-            "help": "合理價無法建立（EPS 或歷史本益比樣本不足），本子項不計分。",
-        })
+    # 合理價僅供參考：由側邊欄 EPS 基準切換器決定分子，不計分、不與缺口比對
+    fair_value = _num(valuation.get("fair_value"))
+    metrics.append({
+        "label": "EPS 合理價 (Fair Value)",
+        "value": f"{fair_value:,.2f} 元" if fair_value is not None else "N/A",
+        "delta": None,
+        "help": "動態 EPS × 歷史本益比中位數；僅供參考，本子項不計分。",
+    })
 
     if pe_pct is not None:
         # 歷史本益比分位：低分位代表相對歷史便宜
@@ -1097,8 +1081,6 @@ def score_financial(fund: dict, valuation: dict) -> dict:
     if cfo_ratio is not None and cfo_ratio < CFO_VETO_RATIO:
         # 現金流為負時採用更精確的警示文案
         vetoes.append(VETO_NEG_CFO if cfo is not None and cfo <= 0 else VETO_CFO)
-    if vgr is not None and vgr > VGR_VETO:
-        vetoes.append(VETO_VGR)
 
     if score is None:
         verdict = "資料不足，本層不計分"
@@ -1115,8 +1097,6 @@ def score_financial(fund: dict, valuation: dict) -> dict:
         bits = []
         if cfo_ratio is not None:
             bits.append(f"CFO/淨利 {cfo_ratio:.2f}x")
-        if vgr is not None:
-            bits.append(f"價值偏差率 {vgr:+.1f}%")
         if pe_pct is not None:
             bits.append(f"歷史 P/E 分位 {pe_pct:.0f}%")
         if dol is not None:

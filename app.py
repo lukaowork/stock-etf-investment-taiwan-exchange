@@ -69,18 +69,10 @@ from valuation import (
     ALPHA_MIN,
     BASELINE_OPTIONS,
     BASELINE_REVENUE,
-    MIN_PE_POINTS,
-    build_scatter_figure,
     build_ttm_eps_series,
-    build_valuation_gap_table,
-    build_valuation_river_figure,
     compute_baseline_eps,
-    compute_correlation,
     compute_fair_value,
     compute_pe_history,
-    compute_win_rate,
-    find_near_support_gaps,
-    format_stat,
 )
 
 # 1. 頁面配置
@@ -314,7 +306,7 @@ days_map = {"近 3 個月": 90, "近 6 個月": 180, "近 1 年": 365, "近 3 �
 start_date = datetime.now() - timedelta(days=days_map[time_frame])
 
 # ---------------------------------------------------------
-# EPS 動態基準切換器：供「EPS 價值與缺口對比」分頁切換基本面估算基準
+# EPS 動態基準切換器：供「四層健檢」推導動態 EPS 與合理價參考
 # ---------------------------------------------------------
 eps_baseline = st.sidebar.selectbox(
     "選擇 EPS 估算基準：",
@@ -1521,14 +1513,13 @@ def render_health_check(
     margin_usage = lookup_margin_usage(margin_frame, code)
     pb_percentile = market_percentile(market_frame, code, "PBratio")
 
-    # ---- 2. 估值快照（與「EPS 價值與缺口相關性」分頁共用同一套基準）----
+    # ---- 2. 估值快照（沿用側邊欄的 EPS 基準切換器）----
     valuation = {
         "price": None,
         "ttm_eps": None,
         "pe_now": None,
         "pe_percentile": None,
         "fair_value": None,
-        "vgr": None,
         "pb_percentile": pb_percentile,
     }
     if df is not None and not df.empty and "Close" in df.columns:
@@ -1695,8 +1686,8 @@ else:
     }
 
 
-    # 主畫面 8 大分頁
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    # 主畫面 7 大分頁
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "📊 核心觀察",
         "📈 K線與技術分析",
         "⚖️ 多標的走勢對比",
@@ -1704,7 +1695,6 @@ else:
         "🏥 四層健檢與 AI 三健檢",
         "📦 庫存帳本",
         "🔍 K線缺口分析",
-        "🧮 EPS價值與缺口相關性",
     ])
 
     # -----------------------------------------------------
@@ -2136,233 +2126,3 @@ else:
                     "🔴 半透明紅色區塊＝向下跳空缺口（動態壓力區，缺口頂部為前一日 Low）。"
                     "色塊僅標示「未回補」缺口，已回補缺口請見上方明細表。"
                 )
-
-    # -----------------------------------------------------
-    # Tab 8: EPS 價值與缺口相關性分析 (Valuation vs. Gap)
-    # -----------------------------------------------------
-    with tab8:
-        st.subheader("🧮 EPS 價值與缺口相關性分析 (Valuation vs. Gap Correlation)")
-        st.caption(
-            "合理價＝TTM EPS × 歷史本益比（中位數）；估值下緣＝× 低點；估值上緣＝× 高點。"
-            "VGR＝(缺口價格 − 合理價) ÷ 合理價 × 100%。"
-            "缺口價格取缺口區間中點，報酬率以缺口當日收盤價為基準往後計算。"
-        )
-
-        focus_label_val = st.selectbox(
-            "選擇要分析估值的標的：",
-            selected_labels,
-            key="valuation_select",
-        )
-        df_val = frames.get(focus_label_val, pd.DataFrame())
-        symbol_val = STOCK_DICT[focus_label_val]
-
-        if df_val.empty or len(df_val) < 60:
-            st.warning(
-                "⚠️ 該標的 K 線資料不足（需至少 60 個交易日），無法進行估值分析。"
-            )
-        else:
-            # 取得逐季 EPS（與 AI 健檢分頁共用同一份快取，不會多打一次 API）
-            fund_val = fetch_fundamentals(symbol_val) or {}
-            eps_quarterly = fund_val.get("eps_quarterly") or {}
-            gaps_val = detect_gaps(df_val)
-
-            # 歷史本益比固定以「實際 TTM EPS」換算，反映市場真實給值
-            ttm_eps = build_ttm_eps_series(df_val.index, eps_quarterly)
-            pe_history = compute_pe_history(df_val["Close"], ttm_eps)
-
-            # 依側邊欄選定的基準計算「動態 EPS (Calculated EPS)」
-            baseline = compute_baseline_eps(
-                quarterly_eps=eps_quarterly,
-                baseline=eps_baseline,
-                revenue_yoy_pct=fund_val.get("revenue_yoy"),
-                alpha=eps_alpha,
-            )
-            st.caption(
-                f"🧪 當前估算基準：{baseline['display']}｜{baseline['detail']}"
-            )
-
-            # 動態合理價 = Calculated EPS × 歷史本益比（中位數／低點／高點）
-            fair = compute_fair_value(pe_history, baseline["eps"])
-
-            if fair is None:
-                st.warning(
-                    "⚠️ 目前基準無法建立合理價，請切換 EPS 基準或檢查財報資料。"
-                )
-                st.caption(
-                    f"套用基準：{baseline['label']}｜{baseline['detail']}。"
-                    f"另需至少 {MIN_PE_POINTS} 個有效本益比樣本；"
-                    "常見原因：ETF／指數型商品沒有 EPS、單季 EPS 為負值、"
-                    "yfinance 未提供該股歷史財報，或上市時間過短。"
-                )
-            else:
-                if baseline["warning"]:
-                    st.warning(baseline["warning"])
-
-                gap_table = build_valuation_gap_table(
-                    gaps_val, df_val["Close"], fair["fair_value"]
-                )
-                star_gaps = find_near_support_gaps(gap_table, fair["support"])
-
-                corr_20 = compute_correlation(
-                    gap_table["VGR(%)"], gap_table["後續20日報酬率(%)"]
-                )
-                corr_60 = compute_correlation(
-                    gap_table["VGR(%)"], gap_table["後續60日報酬率(%)"]
-                )
-                win_rate = compute_win_rate(gap_table)
-
-                # ---------------- 數據指標區 ----------------
-                metric_col1, metric_col2, metric_col3 = st.columns(3)
-                r20 = corr_20["pearson_r"]
-                p20 = corr_20["pearson_p"]
-                if r20 is None:
-                    metric_col1.metric(
-                        "VGR 與後續報酬率相關係數",
-                        "N/A",
-                        help=f"有效樣本 {corr_20['n']} 筆；樣本不足或無變異無法計算。",
-                    )
-                else:
-                    metric_col1.metric(
-                        "VGR 與後續報酬率相關係數 (20日)",
-                        f"r = {r20:+.3f}",
-                        delta=(
-                            f"P-value = {p20:.3f}"
-                            if p20 is not None
-                            else "P-value = N/A"
-                        ),
-                        delta_color="off",
-                    )
-                metric_col2.metric(
-                    "EPS 合理價 (Fair Value)",
-                    f"{fair['fair_value']:.2f} 元",
-                    help=(
-                        f"動態 EPS {fair['eps']:.2f} 元 × 歷史本益比中位數 "
-                        f"{fair['pe_median']:.2f}（樣本 {fair['pe_points']} 個交易日）"
-                        f"；{baseline['detail']}"
-                    ),
-                )
-                metric_col3.metric(
-                    "缺口回踩平均勝率 (%)",
-                    "N/A" if win_rate is None else f"{win_rate:.1f}%",
-                    help=(
-                        "情境 A（-5% ≤ VGR ≤ +5%）的缺口中，"
-                        "後續 20 日報酬率為正的比例。"
-                    ),
-                )
-
-                # ---------------- 統計相關性摘要 ----------------
-                st.markdown("#### 📊 相關係數與顯著性檢定")
-                corr_df = pd.DataFrame(
-                    [
-                        {
-                            "方法": "Pearson",
-                            "20日相關係數": format_stat(corr_20["pearson_r"]),
-                            "20日 P-value": format_stat(corr_20["pearson_p"]),
-                            "60日相關係數": format_stat(corr_60["pearson_r"]),
-                            "60日 P-value": format_stat(corr_60["pearson_p"]),
-                        },
-                        {
-                            "方法": "Spearman",
-                            "20日相關係數": format_stat(corr_20["spearman_r"]),
-                            "20日 P-value": format_stat(corr_20["spearman_p"]),
-                            "60日相關係數": format_stat(corr_60["spearman_r"]),
-                            "60日 P-value": format_stat(corr_60["spearman_p"]),
-                        },
-                    ]
-                )
-                st.dataframe(corr_df, use_container_width=True, hide_index=True)
-                st.caption(
-                    f"有效樣本：20日 {corr_20['n']} 筆／60日 {corr_60['n']} 筆；"
-                    "P-value < 0.05 視為顯著相關。"
-                )
-
-                if gap_table.empty:
-                    st.info("✅ 該標的目前沒有符合條件的缺口事件，無法進行相關性分析。")
-                else:
-                    # ---------------- 統計散佈圖 ----------------
-                    st.markdown("#### 📈 價值偏差率 VGR 與缺口後續報酬率")
-                    horizon = st.radio(
-                        "後續報酬期間",
-                        ["20 日", "60 日"],
-                        horizontal=True,
-                        key="vgr_horizon",
-                    )
-                    y_col = (
-                        "後續20日報酬率(%)"
-                        if horizon == "20 日"
-                        else "後續60日報酬率(%)"
-                    )
-                    y_label = f"缺口後續 {horizon} 股價報酬率 (%)"
-
-                    fig_scatter = build_scatter_figure(gap_table, y_col, y_label)
-                    st.plotly_chart(fig_scatter, use_container_width=True)
-
-                    # ---------------- K 線 + 本益比河流對照 ----------------
-                    st.markdown("#### 📈 K 線與 EPS 合理價河流對照")
-                    fig_river = build_valuation_river_figure(
-                        df=df_val,
-                        pe_history=pe_history,
-                        fair=fair,
-                        gaps=gaps_val,
-                        star_gaps=star_gaps,
-                        title=f"{focus_label_val} K 線、EPS 合理價與本益比走勢",
-                        baseline_label=baseline["display"],
-                    )
-                    st.plotly_chart(fig_river, use_container_width=True)
-                    if star_gaps.empty:
-                        st.caption("⭐ 目前沒有缺口落在估值下緣 ±5% 內。")
-                    else:
-                        st.success(
-                            f"⭐ 有 {len(star_gaps)} 個缺口落在估值下緣 ±5% 內，"
-                            "屬「基本面＋技術面」雙重支撐候選區。"
-                        )
-
-                    # ---------------- 統計分析數據表 + CSV ----------------
-                    st.markdown("#### 📋 缺口估值事件明細")
-                    st.dataframe(
-                        gap_table,
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "日期": st.column_config.TextColumn(
-                                "日期", width="small"
-                            ),
-                            "缺口類型": st.column_config.TextColumn(
-                                "缺口類型", width="medium"
-                            ),
-                            "缺口價格": st.column_config.NumberColumn(
-                                "缺口價格", format="%.2f"
-                            ),
-                            "EPS合理價": st.column_config.NumberColumn(
-                                "EPS合理價", format="%.2f"
-                            ),
-                            "VGR(%)": st.column_config.NumberColumn(
-                                "VGR(%)", format="%.2f"
-                            ),
-                            "情境標記": st.column_config.TextColumn(
-                                "情境標記", width="large"
-                            ),
-                            "缺口狀態": st.column_config.TextColumn(
-                                "缺口狀態", width="medium"
-                            ),
-                            "後續20日報酬率(%)": st.column_config.NumberColumn(
-                                "後續20日報酬率(%)", format="%.2f"
-                            ),
-                            "後續60日報酬率(%)": st.column_config.NumberColumn(
-                                "後續60日報酬率(%)", format="%.2f"
-                            ),
-                            "預測評級": st.column_config.TextColumn(
-                                "預測評級", width="small"
-                            ),
-                        },
-                    )
-                    st.download_button(
-                        "📥 下載缺口估值分析 CSV",
-                        data=gap_table.to_csv(index=False).encode("utf-8-sig"),
-                        file_name=f"{symbol_val}_gap_valuation.csv",
-                        mime="text/csv",
-                    )
-                    st.caption(
-                        "📎 EPS 來源：yfinance 逐季公告日財報（備援為財期末），"
-                        "本益比＝收盤價 ÷ 當日 TTM EPS；無效樣本以 N/A 呈現。"
-                    )
